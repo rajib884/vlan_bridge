@@ -186,6 +186,27 @@ typedef struct {
     uint64_t ignored;
 } proxy_ctx_t;
 
+/* ── discovery mode state ───────────────────────────────────────────────────
+ * Passive scan that records each unique (VLAN, source MAC) seen in tagged
+ * ARP/ICMP traffic, along with an associated IP, to reveal the -t / -v values
+ * needed for bridge mode. Never sends anything.
+ * ──────────────────────────────────────────────────────────────────────── */
+#define DISC_MAX 256
+
+typedef struct {
+    uint16_t vlan_id;
+    uint8_t  mac[ETH_ALEN];
+    uint32_t ip;            /* first associated IP, network order (0 if none) */
+    uint64_t count;         /* matching frames seen                           */
+} disc_entry_t;
+
+typedef struct {
+    uint32_t     filter_ip; /* network order; 0 = no filter                   */
+    int          verbose;   /* -d: also log every matching packet             */
+    int          n;         /* entries in use                                 */
+    disc_entry_t e[DISC_MAX];
+} disc_ctx_t;
+
 /* ── helpers ────────────────────────────────────────────────────────────── */
 
 static int parse_mac(const char *str, uint8_t *mac)
@@ -1034,20 +1055,219 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type)
     }
 }
 
+/* ── discovery mode ─────────────────────────────────────────────────────── */
+
+/* Format a network-order IPv4 address into dotted decimal. 'buf' must hold at
+ * least 16 bytes. Avoids inet_ntoa's shared static buffer (which would alias
+ * when two addresses are printed in one log line). */
+static void ip_to_str(uint32_t ip_net, char *buf, size_t sz)
+{
+    const uint8_t *b = (const uint8_t *)&ip_net;
+    snprintf(buf, sz, "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+}
+
+/* BPF: VLAN-tagged ARP, or VLAN-tagged IPv4/ICMP. Manual offsets match the
+ * style of build_bpf(). In a tagged frame the inner ethertype is at [16:2] and
+ * the IP protocol byte is at 18 (IP header start) + 9 = 27. */
+static void build_discovery_bpf(char *buf, size_t sz)
+{
+    snprintf(buf, sz,
+        "ether[12:2] = 0x8100 and ("
+        "ether[16:2] = 0x0806 or "
+        "(ether[16:2] = 0x0800 and ether[27] = 1))");
+}
+
+static void discovery_handler(u_char *user,
+                              const struct pcap_pkthdr *hdr,
+                              const u_char *pkt)
+{
+    disc_ctx_t *dc = (disc_ctx_t *)user;
+
+    if (hdr->caplen < 18) return;                       /* tagged eth header  */
+    uint16_t tpid = (uint16_t)((pkt[12] << 8) | pkt[13]);
+    if (tpid != ETHERTYPE_VLAN) return;                 /* BPF already ensures */
+
+    uint16_t vid   = (uint16_t)(((pkt[14] << 8) | pkt[15]) & 0x0FFF);
+    uint16_t inner = (uint16_t)((pkt[16] << 8) | pkt[17]);
+    const uint8_t *src_mac = pkt + 6;
+
+    uint32_t ip_a = 0, ip_b = 0;    /* ARP: sender/target; IPv4: src/dst */
+    const char *proto;
+
+    if (inner == 0x0806) {                              /* ARP */
+        if (hdr->caplen < 46) return;                   /* need through tpa   */
+        memcpy(&ip_a, pkt + 32, 4);                     /* spa (sender IP)    */
+        memcpy(&ip_b, pkt + 42, 4);                     /* tpa (target IP)    */
+        proto = "ARP";
+    } else if (inner == ETHERTYPE_IPV4) {               /* IPv4 */
+        if (hdr->caplen < 38) return;                   /* need through dst IP */
+        if (pkt[27] != IP_PROTO_ICMP) return;
+        memcpy(&ip_a, pkt + 30, 4);                     /* src IP */
+        memcpy(&ip_b, pkt + 34, 4);                     /* dst IP */
+        proto = "ICMP";
+    } else {
+        return;
+    }
+
+    /* IP filter: keep only frames where the target IP is on either side. */
+    if (dc->filter_ip != 0 && dc->filter_ip != ip_a && dc->filter_ip != ip_b)
+        return;
+
+    /* Find an existing (VLAN, source MAC) entry. */
+    int idx = -1;
+    for (int i = 0; i < dc->n; i++) {
+        if (dc->e[i].vlan_id == vid && mac_eq(dc->e[i].mac, src_mac)) {
+            idx = i;
+            break;
+        }
+    }
+
+    char ipa[16], ipb[16];
+    ip_to_str(ip_a, ipa, sizeof(ipa));
+    ip_to_str(ip_b, ipb, sizeof(ipb));
+
+    if (idx < 0) {
+        if (dc->n >= DISC_MAX) return;                  /* table full */
+        idx = dc->n++;
+        dc->e[idx].vlan_id = vid;
+        memcpy(dc->e[idx].mac, src_mac, ETH_ALEN);
+        dc->e[idx].ip    = ip_a;                        /* device's own IP */
+        dc->e[idx].count = 1;
+        log_printf(LOG_INFO, "[DISC] New: VLAN %-4u ", vid);
+        print_mac(src_mac);
+        log_printf(LOG_INFO, "  IP %-15s  via %s\n", ipa, proto);
+    } else {
+        dc->e[idx].count++;
+        if (dc->e[idx].ip == 0) dc->e[idx].ip = ip_a;
+    }
+
+    if (dc->verbose) {
+        log_printf(LOG_INFO, "[DISC] VLAN %-4u ", vid);
+        print_mac(src_mac);
+        log_printf(LOG_INFO, "  %-4s %s->%s\n", proto, ipa, ipb);
+    }
+    log_flush();
+}
+
+/* Sort discovered entries by VLAN, then MAC (insertion sort; n <= DISC_MAX). */
+static void disc_sort(disc_ctx_t *dc)
+{
+    for (int i = 1; i < dc->n; i++) {
+        disc_entry_t key = dc->e[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               (dc->e[j].vlan_id > key.vlan_id ||
+                (dc->e[j].vlan_id == key.vlan_id &&
+                 memcmp(dc->e[j].mac, key.mac, ETH_ALEN) > 0))) {
+            dc->e[j + 1] = dc->e[j];
+            j--;
+        }
+        dc->e[j + 1] = key;
+    }
+}
+
+/* Open the interface, capture tagged ARP/ICMP, and print a summary on exit. */
+static int run_discovery(const char *iface, uint32_t filter_ip, int verbose)
+{
+    char errbuf[PCAP_ERRBUF_SIZE];
+    pcap_t *handle = pcap_open_live(iface, SNAP_LEN, PROMISC, TIMEOUT_MS, errbuf);
+    if (!handle) {
+        log_printf(LOG_ERROR, "pcap_open_live: %s\n", errbuf);
+        log_flush();
+        return 1;
+    }
+    if (pcap_datalink(handle) != DLT_EN10MB) {
+        log_printf(LOG_ERROR, "Interface is not Ethernet (DLT_EN10MB).\n");
+        pcap_close(handle);
+        log_flush();
+        return 1;
+    }
+
+    char filter_str[256];
+    build_discovery_bpf(filter_str, sizeof(filter_str));
+
+    struct bpf_program fp;
+    if (pcap_compile(handle, &fp, filter_str, 1, PCAP_NETMASK_UNKNOWN) == -1) {
+        log_printf(LOG_ERROR, "pcap_compile: %s\n", pcap_geterr(handle));
+        pcap_close(handle);
+        log_flush();
+        return 1;
+    }
+    if (pcap_setfilter(handle, &fp) == -1) {
+        log_printf(LOG_ERROR, "pcap_setfilter: %s\n", pcap_geterr(handle));
+        pcap_freecode(&fp);
+        pcap_close(handle);
+        log_flush();
+        return 1;
+    }
+    pcap_freecode(&fp);
+
+    disc_ctx_t *dc = (disc_ctx_t *)calloc(1, sizeof(disc_ctx_t));
+    if (!dc) {
+        log_printf(LOG_ERROR, "Out of memory\n");
+        pcap_close(handle);
+        log_flush();
+        return 1;
+    }
+    dc->filter_ip = filter_ip;
+    dc->verbose   = verbose;
+
+    /* Ctrl+C breaks the loop so the summary prints (reuses the bridge's handler). */
+    g_pcap_handle = handle;
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
+    log_printf(LOG_INFO, "Discovery on %s  (Ctrl+C to stop)\n", iface);
+    if (filter_ip) {
+        char f[16];
+        ip_to_str(filter_ip, f, sizeof(f));
+        log_printf(LOG_INFO, "IP filter : %s (either side)\n", f);
+    }
+    log_printf(LOG_INFO, "BPF filter: %s\n\n", filter_str);
+    log_flush();
+
+    pcap_loop(handle, 0, discovery_handler, (u_char *)dc);
+
+    /* ── summary table ────────────────────────────────────────────────── */
+    disc_sort(dc);
+    log_printf(LOG_INFO, "\n--- Discovered %d device(s) ---\n", dc->n);
+    if (dc->n == 0) {
+        log_printf(LOG_INFO,
+            "(no tagged ARP/ICMP seen — verify the NIC delivers VLAN tags to "
+            "Npcap; hardware VLAN offload may strip them)\n");
+    } else {
+        log_printf(LOG_INFO, "VLAN  MAC                IP               pkts\n");
+        for (int i = 0; i < dc->n; i++) {
+            char ipbuf[16];
+            ip_to_str(dc->e[i].ip, ipbuf, sizeof(ipbuf));
+            log_printf(LOG_INFO, "%-4u  ", dc->e[i].vlan_id);
+            print_mac(dc->e[i].mac);
+            log_printf(LOG_INFO, "  %-15s  %llu\n", ipbuf, dc->e[i].count);
+        }
+    }
+
+    free(dc);
+    pcap_close(handle);
+    log_close();
+    return 0;
+}
+
 /* Usage goes straight to stderr so it works before the logger is initialised
  * (argument parsing happens before log_init so -o can choose the log target). */
 static void usage(const char *prog)
 {
     fprintf(stderr,
         "Usage: %s -i <interface> -t <target_mac> -v <vlan_id> [-o <logfile>] [-d]\n"
+        "       %s -s -i <interface> [-f <ip>] [-o <logfile>] [-d]\n"
         "       %s -l\n\n"
         "  -i   Npcap interface name (e.g. \\Device\\NPF_{GUID})\n"
         "  -t   Target MAC address   (e.g. AA:BB:CC:DD:EE:FF)\n"
         "  -v   VLAN ID              (1-4094)\n"
+        "  -s   Discovery mode: scan tagged ARP/ICMP to find target MAC + VLAN\n"
+        "  -f   Discovery IP filter: only frames with this IP on either side\n"
         "  -o   Write log to <logfile> instead of stdout\n"
         "  -d   Verbose: keep per-packet logging during capture\n"
         "  -l   List interfaces and exit\n",
-        prog, prog);
+        prog, prog, prog);
 }
 
 int main(int argc, char *argv[])
@@ -1055,14 +1275,18 @@ int main(int argc, char *argv[])
     char    *iface      = NULL;
     char    *target_str = NULL;
     char    *logfile    = NULL;
+    char    *filter_str_ip = NULL;
     int      vlan_id    = -1;
     int      do_list    = 0;
+    int      do_scan    = 0;
     int      verbose    = 0;
 
     /* ── parse args ──────────────────────────────────────────────────── */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0) {
             do_list = 1;
+        } else if (strcmp(argv[i], "-s") == 0) {
+            do_scan = 1;
         } else if (strcmp(argv[i], "-d") == 0) {
             verbose = 1;
         } else if (strcmp(argv[i], "-i") == 0 && i+1 < argc) {
@@ -1071,6 +1295,8 @@ int main(int argc, char *argv[])
             target_str = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 && i+1 < argc) {
             vlan_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-f") == 0 && i+1 < argc) {
+            filter_str_ip = argv[++i];
         } else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) {
             logfile = argv[++i];
         } else {
@@ -1091,6 +1317,25 @@ int main(int argc, char *argv[])
 #endif
         log_close();
         return 0;
+    }
+
+    /* ── discovery mode ──────────────────────────────────────────────── */
+    if (do_scan) {
+        if (!iface) {
+            usage(argv[0]);
+            log_close();
+            return 1;
+        }
+        uint32_t filter_ip = 0;   /* 0 = no filter */
+        if (filter_str_ip) {
+            filter_ip = inet_addr(filter_str_ip);   /* network order */
+            if (filter_ip == INADDR_NONE) {
+                log_printf(LOG_ERROR, "Invalid -f IP address: %s\n", filter_str_ip);
+                log_close();
+                return 1;
+            }
+        }
+        return run_discovery(iface, filter_ip, verbose);
     }
 
     if (!iface || !target_str || vlan_id < 1 || vlan_id > 4094) {
