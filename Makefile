@@ -38,7 +38,7 @@ HDRS      = engine.h fast_log.h
 GUI_TARGET ?= vlan_bridge_gui.exe
 GUI_SRCS    = vlan_bridge_gui.c engine.c fast_log.c
 GUI_RC      = vlan_bridge_gui.rc
-GUI_LIBS    = -lcomctl32 -lgdi32 -luser32
+GUI_LIBS    = -lcomctl32 -lgdi32 -luser32 -lshell32
 
 # Npcap SDK: location, version, and auto-download URL.
 SDK          ?= npcap-sdk

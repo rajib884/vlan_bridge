@@ -53,9 +53,15 @@ window covers the whole workflow:
 2. **Scan** to discover VLAN-tagged devices; double-click a row (or select it and
    **Add Selected → Rules**) to turn it into a `(MAC → VLAN)` rule.
 3. Or type a MAC + VLAN and **Add Rule**. Build as many rules as you need.
-4. **Start** the bridge. The rules table shows live per-target Out/In counts, the
-   stats line shows aggregate counters, and the log pane streams engine output.
-   **Stop** to edit rules and start again.
+4. **Start** the bridge. The rules table shows live per-target Out/In totals and
+   **Out/s / In/s** packet rates, the stats line shows aggregate counters, and
+   the log pane streams engine output. **Stop** to edit rules and start again.
+
+Rules, the selected interface, checkboxes, and the window size/position are
+saved to `%APPDATA%\vlan_bridge\config.ini` and restored on the next launch.
+Tick **Auto-start** to begin bridging automatically at startup. **Minimizing**
+hides the app to a system-tray icon (double-click to restore, right-click for a
+menu).
 
 ## CLI usage
 

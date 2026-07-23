@@ -12,6 +12,7 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <shellapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -35,9 +36,16 @@
 #define IDC_STATS_LBL     1012
 #define IDC_LOG_EDIT      1013
 #define IDC_DISC_TOGGLE   1014
+#define IDC_AUTOSTART_CHK 1015
+
+#define IDM_TRAY_SHOW     2001    /* tray context-menu items                    */
+#define IDM_TRAY_EXIT     2002
 
 #define WM_APP_BRIDGE_DONE (WM_APP + 1)
 #define WM_APP_SCAN_DONE   (WM_APP + 2)
+#define WM_APP_TRAY        (WM_APP + 3)   /* tray icon callback                 */
+#define WM_APP_AUTOSTART   (WM_APP + 4)   /* deferred auto-start after startup  */
+#define TRAY_UID           1
 #define TIMER_ID           1
 #define TIMER_MS           250
 
@@ -53,6 +61,7 @@ enum { ST_IDLE = 0, ST_SCANNING, ST_BRIDGING };
 static HWND g_main, g_iface, g_scan, g_disc, g_addsel, g_macedit, g_vlanedit;
 static HWND g_addrule, g_remove, g_rules, g_start, g_verbose, g_stats, g_log;
 static HWND g_lbl_iface, g_lbl_disc, g_lbl_rules, g_lbl_log, g_disc_toggle;
+static HWND g_autostart;
 static HFONT g_font;
 static HBRUSH g_bg;            /* window/static background, matches the class  */
 static int    g_dpi = 96;
@@ -77,6 +86,17 @@ static int             g_rules_sort_asc = 1;
 
 static HANDLE g_worker = NULL;
 static int    g_state  = ST_IDLE;
+
+/* per-rule rate tracking (packets/sec, updated on the timer while bridging) */
+static uint64_t  g_prev_out[ENGINE_MAX_RULES], g_prev_in[ENGINE_MAX_RULES];
+static double    g_rate_out[ENGINE_MAX_RULES], g_rate_in[ENGINE_MAX_RULES];
+static ULONGLONG g_rate_last;
+
+static NOTIFYICONDATAA g_nid;         /* system-tray icon                       */
+static int             g_tray_added;
+
+static RECT g_win_rect;               /* saved window placement (0 = none)      */
+static int  g_have_win_rect;
 
 static void layout(int cw, int ch);      /* defined in the layout section below */
 static void config_save(void);           /* defined in the config section below */
@@ -239,18 +259,49 @@ static void rules_refresh(void)
         lv_set(g_rules, i, 2, num);
         snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].in_stripped);
         lv_set(g_rules, i, 3, num);
+        lv_set(g_rules, i, 4, "0");     /* Out/s */
+        lv_set(g_rules, i, 5, "0");     /* In/s  */
     }
 }
 
-/* Update just the live counter columns (called on the timer while bridging). */
-static void rules_update_counts(void)
+/* Zero the per-rule rate baseline for a fresh run (called from on_start). */
+static void rates_reset(void)
 {
     for (int i = 0; i < g_cfg.n_rules; i++) {
+        g_prev_out[i] = g_prev_in[i] = 0;
+        g_rate_out[i] = g_rate_in[i] = 0.0;
+    }
+    g_rate_last = GetTickCount64();
+}
+
+/* Update the live counter + rate columns (called on the timer while bridging).
+ * Rates are packets/sec over the tick interval, lightly EMA-smoothed. */
+static void rules_update_counts(void)
+{
+    ULONGLONG now = GetTickCount64();
+    double dt = (double)(now - g_rate_last) / 1000.0;
+    if (dt <= 0.0) dt = (double)TIMER_MS / 1000.0;
+    g_rate_last = now;
+
+    for (int i = 0; i < g_cfg.n_rules; i++) {
+        uint64_t out = g_cfg.rules[i].out_tagged;
+        uint64_t in  = g_cfg.rules[i].in_stripped;
+        double ro = (double)(out - g_prev_out[i]) / dt;
+        double ri = (double)(in  - g_prev_in[i])  / dt;
+        g_prev_out[i] = out;
+        g_prev_in[i]  = in;
+        g_rate_out[i] = g_rate_out[i] * 0.5 + ro * 0.5;
+        g_rate_in[i]  = g_rate_in[i]  * 0.5 + ri * 0.5;
+
         char num[24];
-        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].out_tagged);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)out);
         lv_set(g_rules, i, 2, num);
-        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].in_stripped);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)in);
         lv_set(g_rules, i, 3, num);
+        snprintf(num, sizeof(num), "%.0f", g_rate_out[i]);
+        lv_set(g_rules, i, 4, num);
+        snprintf(num, sizeof(num), "%.0f", g_rate_in[i]);
+        lv_set(g_rules, i, 5, num);
     }
 }
 
@@ -394,7 +445,16 @@ static void config_save(void)
         fprintf(f, "iface=%s\n", g_ifaces[sel].npf_name);
     fprintf(f, "verbose=%d\n",
             SendMessage(g_verbose, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
+    fprintf(f, "autostart=%d\n",
+            SendMessage(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
     fprintf(f, "collapsed=%d\n", g_disc_collapsed);
+
+    WINDOWPLACEMENT wpl; wpl.length = sizeof(wpl);
+    if (GetWindowPlacement(g_main, &wpl)) {       /* restored (non-min) rect */
+        RECT r = wpl.rcNormalPosition;
+        fprintf(f, "window=%ld %ld %ld %ld\n",
+                r.left, r.top, r.right, r.bottom);
+    }
     for (int i = 0; i < g_cfg.n_rules; i++) {
         char mac[18];
         engine_format_mac(g_cfg.rules[i].mac, mac, sizeof(mac));
@@ -420,6 +480,17 @@ static void config_load(void)
         } else if (strncmp(line, "verbose=", 8) == 0) {
             SendMessage(g_verbose, BM_SETCHECK,
                         atoi(line + 8) ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (strncmp(line, "autostart=", 10) == 0) {
+            SendMessage(g_autostart, BM_SETCHECK,
+                        atoi(line + 10) ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (strncmp(line, "window=", 7) == 0) {
+            RECT r;
+            if (sscanf(line + 7, "%ld %ld %ld %ld",
+                       &r.left, &r.top, &r.right, &r.bottom) == 4 &&
+                r.right - r.left >= 100 && r.bottom - r.top >= 100) {
+                g_win_rect = r;
+                g_have_win_rect = 1;
+            }
         } else if (strncmp(line, "collapsed=", 10) == 0) {
             g_disc_collapsed = atoi(line + 10) ? 1 : 0;
             SetWindowTextA(g_disc_toggle, g_disc_collapsed ? "Show" : "Hide");
@@ -609,9 +680,10 @@ static void on_start(void)
     g_cfg.verbose = (SendMessage(g_verbose, BM_GETCHECK, 0, 0) == BST_CHECKED);
     config_save();                       /* persist iface + verbose choice */
 
-    /* reset per-rule counters for a fresh run */
+    /* reset per-rule counters + rate baseline for a fresh run */
     for (int i = 0; i < g_cfg.n_rules; i++)
         g_cfg.rules[i].out_tagged = g_cfg.rules[i].in_stripped = 0;
+    rates_reset();
 
     ui_set_state(ST_BRIDGING);
     g_worker = CreateThread(NULL, 0, bridge_thread, NULL, 0, NULL);
@@ -626,8 +698,16 @@ static void worker_done(void)
         g_worker = NULL;
     }
     pump_log();
-    if (g_state == ST_BRIDGING) { rules_update_counts(); stats_refresh(); }
-    else if (g_state == ST_SCANNING) { disc_refresh(); }
+    if (g_state == ST_BRIDGING) {
+        rules_update_counts();
+        stats_refresh();
+        for (int i = 0; i < g_cfg.n_rules; i++) {   /* traffic stopped: rate 0 */
+            lv_set(g_rules, i, 4, "0");
+            lv_set(g_rules, i, 5, "0");
+        }
+    } else if (g_state == ST_SCANNING) {
+        disc_refresh();
+    }
     ui_set_state(ST_IDLE);
 }
 
@@ -699,13 +779,15 @@ static void layout(int cw, int ch)
     y += row_h + GAP;
 
     MoveWindow(g_rules, x, y, w, S(112), TRUE);
-    lv_fill_last_col(g_rules, 4);
+    lv_fill_last_col(g_rules, 6);
     y += S(112) + SGAP;
 
-    /* run row: Start + verbose checkbox, both centred on the button */
+    /* run row: Start + verbose + auto-start checkboxes, centred on the button */
     const int chk_h = S(20);
-    MoveWindow(g_start,   x, y, S(100), S(28), TRUE);
-    MoveWindow(g_verbose, x + S(100 + 12), y + (S(28) - chk_h) / 2, S(120), chk_h, TRUE);
+    const int chk_y = y + (S(28) - chk_h) / 2;
+    MoveWindow(g_start,     x,                       y,     S(100), S(28),  TRUE);
+    MoveWindow(g_verbose,   x + S(100 + 12),         chk_y, S(110), chk_h,  TRUE);
+    MoveWindow(g_autostart, x + S(100 + 12 + 110 + 8), chk_y, S(120), chk_h, TRUE);
     y += S(28) + GAP;
 
     /* stats gets a full-width line of its own — the string is long and was
@@ -783,14 +865,18 @@ static void create_controls(HWND w)
     SendMessage(g_rules, LVM_SETEXTENDEDLISTVIEWSTYLE,
                 LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER,
                 LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
-    lv_add_col(g_rules, 0, "Target MAC", S(180));
-    lv_add_col(g_rules, 1, "VLAN", S(60));
-    lv_add_col(g_rules, 2, "Out",  S(100));
-    lv_add_col(g_rules, 3, "In",   S(100));
+    lv_add_col(g_rules, 0, "Target MAC", S(170));
+    lv_add_col(g_rules, 1, "VLAN",  S(55));
+    lv_add_col(g_rules, 2, "Out",   S(85));
+    lv_add_col(g_rules, 3, "In",    S(85));
+    lv_add_col(g_rules, 4, "Out/s", S(65));
+    lv_add_col(g_rules, 5, "In/s",  S(65));
 
-    g_start   = mk("BUTTON", "Start", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_START_BTN, w);
-    g_verbose = mk("BUTTON", "&Verbose log",
-                   BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VERBOSE_CHK, w);
+    g_start     = mk("BUTTON", "Start", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_START_BTN, w);
+    g_verbose   = mk("BUTTON", "&Verbose log",
+                     BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VERBOSE_CHK, w);
+    g_autostart = mk("BUTTON", "&Auto-start",
+                     BS_AUTOCHECKBOX | WS_TABSTOP, IDC_AUTOSTART_CHK, w);
     g_stats   = mk("STATIC", "", SS_LEFT | SS_ENDELLIPSIS, IDC_STATS_LBL, w);
 
     g_lbl_log = mk("STATIC", "Log", SS_LEFT, -1, w);
@@ -818,6 +904,50 @@ static void populate_ifaces(void)
     if (g_n_ifaces > 0) SendMessage(g_iface, CB_SETCURSEL, 0, 0);
 }
 
+/* ── system tray ────────────────────────────────────────────────────────── */
+static void tray_add(void)
+{
+    if (g_tray_added) return;
+    memset(&g_nid, 0, sizeof(g_nid));
+    g_nid.cbSize           = sizeof(g_nid);
+    g_nid.hWnd             = g_main;
+    g_nid.uID              = TRAY_UID;
+    g_nid.uFlags           = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+    g_nid.uCallbackMessage = WM_APP_TRAY;
+    g_nid.hIcon            = LoadIcon(NULL, IDI_APPLICATION);
+    snprintf(g_nid.szTip, sizeof(g_nid.szTip), "%s",
+             g_state == ST_BRIDGING ? "VLAN Bridge - running" : "VLAN Bridge");
+    if (Shell_NotifyIconA(NIM_ADD, &g_nid)) g_tray_added = 1;
+}
+
+static void tray_remove(void)
+{
+    if (!g_tray_added) return;
+    Shell_NotifyIconA(NIM_DELETE, &g_nid);
+    g_tray_added = 0;
+}
+
+static void tray_restore(void)
+{
+    tray_remove();
+    ShowWindow(g_main, SW_SHOW);
+    ShowWindow(g_main, SW_RESTORE);
+    SetForegroundWindow(g_main);
+}
+
+static void tray_menu(void)
+{
+    POINT pt;
+    GetCursorPos(&pt);
+    HMENU m = CreatePopupMenu();
+    AppendMenuA(m, MF_STRING, IDM_TRAY_SHOW, "Show");
+    AppendMenuA(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuA(m, MF_STRING, IDM_TRAY_EXIT, "Exit");
+    SetForegroundWindow(g_main);           /* so the menu closes on click-away */
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_main, NULL);
+    DestroyMenu(m);
+}
+
 static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -825,13 +955,35 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         g_main = w;
         create_controls(w);
         populate_ifaces();
-        config_load();        /* restore rules / iface / verbose from last run */
+        config_load();        /* restore rules / iface / verbose / window / etc */
+        if (g_have_win_rect) {                    /* restore saved placement */
+            RECT r = g_win_rect;
+            int ww = r.right - r.left, wh = r.bottom - r.top;
+            int vx = GetSystemMetrics(SM_XVIRTUALSCREEN);
+            int vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+            int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+            int vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+            if (r.left > vx + vw - 60) r.left = vx + vw - ww;   /* keep on-screen */
+            if (r.top  > vy + vh - 60) r.top  = vy + vh - wh;
+            if (r.left < vx) r.left = vx;
+            if (r.top  < vy) r.top  = vy;
+            MoveWindow(w, r.left, r.top, ww, wh, FALSE);
+        }
         ui_set_state(ST_IDLE);
         stats_refresh();      /* show zeroed counters rather than a blank line */
         SetTimer(w, TIMER_ID, TIMER_MS, NULL);
+        if (SendMessage(g_autostart, BM_GETCHECK, 0, 0) == BST_CHECKED &&
+            g_cfg.n_rules > 0 &&
+            SendMessage(g_iface, CB_GETCURSEL, 0, 0) >= 0)
+            PostMessage(w, WM_APP_AUTOSTART, 0, 0);
         return 0;
 
     case WM_SIZE:
+        if (wp == SIZE_MINIMIZED) {               /* minimize hides to the tray */
+            tray_add();
+            ShowWindow(w, SW_HIDE);
+            return 0;
+        }
         layout(LOWORD(lp), HIWORD(lp));
         return 0;
 
@@ -869,9 +1021,21 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
             if (HIWORD(wp) == CBN_SELCHANGE) config_save();
             return 0;
         case IDC_VERBOSE_CHK:
+        case IDC_AUTOSTART_CHK:
             if (HIWORD(wp) == BN_CLICKED) config_save();
             return 0;
+        case IDM_TRAY_SHOW:  tray_restore();          return 0;
+        case IDM_TRAY_EXIT:  SendMessage(w, WM_CLOSE, 0, 0); return 0;
         }
+        return 0;
+
+    case WM_APP_TRAY:
+        if (LOWORD(lp) == WM_LBUTTONDBLCLK) tray_restore();
+        else if (LOWORD(lp) == WM_RBUTTONUP) tray_menu();
+        return 0;
+
+    case WM_APP_AUTOSTART:
+        on_start();
         return 0;
 
     case WM_NOTIFY: {
@@ -902,6 +1066,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_CLOSE:
         config_save();                      /* persist final UI state */
+        tray_remove();
         if (g_state != ST_IDLE) {           /* stop capture before exiting */
             engine_stop();
             if (g_worker) {

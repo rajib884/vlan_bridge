@@ -116,8 +116,19 @@ Or just `make` / `make gui` under MSYS2 with `SDK=/c/npcap-sdk CC=gcc`.
 13. **Config persists across restarts:** add rules / pick an interface / set
     verbose / collapse, close the app, reopen — the same state is restored.
     Config is `%APPDATA%\vlan_bridge\config.ini` (plain text: `iface=`,
-    `verbose=`, `collapsed=`, one `rule=MAC VID` per rule). Deleting the file
-    resets to empty; a malformed line is skipped, not fatal.
+    `verbose=`, `autostart=`, `collapsed=`, `window=L T R B`, one
+    `rule=MAC VID` per rule). Deleting the file resets to empty; a malformed
+    line is skipped, not fatal.
+14. **Per-rule pps:** while bridging, the rules table's **Out/s** and **In/s**
+    columns show a smoothed packets/sec rate; they read 0 once traffic stops.
+15. **Minimize to tray:** minimizing hides the window to a system-tray icon.
+    Double-click the icon (or right-click → Show) restores it; right-click →
+    Exit quits. Tooltip reflects running/idle.
+16. **Auto-start:** tick **Auto-start** and it's saved; next launch, if there
+    are rules and an interface, the bridge starts automatically. Empty config
+    does not nag.
+17. **Window size/position** is remembered and restored on the next launch
+    (clamped back on-screen if the saved spot is off all monitors).
 
 ### CLI (`vlan_bridge.exe`) — regression
 - `vlan_bridge -l` lists interfaces (name/IP/MAC).
