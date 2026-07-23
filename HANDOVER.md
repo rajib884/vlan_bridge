@@ -104,6 +104,15 @@ Or just `make` / `make gui` under MSYS2 with `SDK=/c/npcap-sdk CC=gcc`.
 7. Closing the window while running stops capture cleanly (no crash/hang).
 8. In **Wireshark** on the trunk: unicast to each target is tagged with **that
    target's** VLAN; a local broadcast (ARP) appears **once per distinct VLAN**.
+9. **Log pane keeps streaming** for a long run — it must not freeze after the
+   first ~30 KB (the edit control's default cap is now lifted; oldest lines are
+   trimmed instead).
+10. During a **Scan** the discovery list **updates in place** — packet counts
+    tick up without the whole list flickering or dropping your selection.
+11. **Click a column header** on either list to sort; clicking again reverses.
+    (Rules only sort while stopped.)
+12. **Hide/Show** toggle on the "Discovered devices" header collapses the scan
+    section; the log pane grows to fill the freed space.
 
 ### CLI (`vlan_bridge.exe`) — regression
 - `vlan_bridge -l` lists interfaces (name/IP/MAC).

@@ -34,18 +34,25 @@
 #define IDC_VERBOSE_CHK   1011
 #define IDC_STATS_LBL     1012
 #define IDC_LOG_EDIT      1013
+#define IDC_DISC_TOGGLE   1014
 
 #define WM_APP_BRIDGE_DONE (WM_APP + 1)
 #define WM_APP_SCAN_DONE   (WM_APP + 2)
 #define TIMER_ID           1
 #define TIMER_MS           250
 
+/* The log EDIT silently stops accepting text at its internal limit and would
+ * otherwise grow without bound, so trim the oldest lines past LOG_MAX_CHARS
+ * back down to about LOG_KEEP_CHARS. */
+#define LOG_MAX_CHARS  400000
+#define LOG_KEEP_CHARS 250000
+
 enum { ST_IDLE = 0, ST_SCANNING, ST_BRIDGING };
 
 /* ── globals ────────────────────────────────────────────────────────────── */
 static HWND g_main, g_iface, g_scan, g_disc, g_addsel, g_macedit, g_vlanedit;
 static HWND g_addrule, g_remove, g_rules, g_start, g_verbose, g_stats, g_log;
-static HWND g_lbl_iface, g_lbl_disc, g_lbl_rules, g_lbl_log;
+static HWND g_lbl_iface, g_lbl_disc, g_lbl_rules, g_lbl_log, g_disc_toggle;
 static HFONT g_font;
 static HBRUSH g_bg;            /* window/static background, matches the class  */
 static int    g_dpi = 96;
@@ -60,9 +67,18 @@ static int          g_n_ifaces;
 static engine_config_t g_cfg;             /* rules edited by UI, read by worker */
 static disc_row_t      g_disc_rows[ENGINE_DISC_MAX];  /* mirrors disc list order */
 static int             g_disc_shown;
+static disc_row_t      g_disc_prev[ENGINE_DISC_MAX];  /* last-rendered rows       */
+static int             g_disc_prev_n;
+static int             g_disc_collapsed;              /* hide the scan section    */
+static int             g_disc_sort_col = 0;           /* 0=VLAN 1=MAC 2=IP 3=pkts */
+static int             g_disc_sort_asc = 1;
+static int             g_rules_sort_col = -1;         /* -1 = insertion order     */
+static int             g_rules_sort_asc = 1;
 
 static HANDLE g_worker = NULL;
 static int    g_state  = ST_IDLE;
+
+static void layout(int cw, int ch);      /* defined in the layout section below */
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 static void set_font(HWND h) { if (g_font) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
@@ -141,9 +157,18 @@ static void lv_fill_last_col(HWND lv, int n_cols)
  * CRLF so the multiline control renders newlines. */
 static void log_append(const char *data, int len)
 {
-    /* Keep the control from growing without bound. */
-    if (GetWindowTextLengthA(g_log) > 500000)
-        SetWindowTextA(g_log, "");
+    /* Trim the oldest lines when the control gets large. Deleting from the top
+     * (rather than clearing everything, and rather than letting it silently
+     * hit its limit and stop) keeps recent output visible without a hard reset. */
+    int cur = GetWindowTextLengthA(g_log);
+    if (cur > LOG_MAX_CHARS) {
+        int cut  = cur - LOG_KEEP_CHARS;
+        int line = (int)SendMessageA(g_log, EM_LINEFROMCHAR, (WPARAM)cut, 0);
+        int idx  = (int)SendMessageA(g_log, EM_LINEINDEX, (WPARAM)(line + 1), 0);
+        if (idx > 0) cut = idx;                /* snap the cut to a line start */
+        SendMessageA(g_log, EM_SETSEL, 0, (LPARAM)cut);
+        SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)"");
+    }
 
     char *tmp = (char *)malloc((size_t)len * 2 + 1);
     if (!tmp) return;
@@ -157,6 +182,7 @@ static void log_append(const char *data, int len)
     int end = GetWindowTextLengthA(g_log);
     SendMessageA(g_log, EM_SETSEL, (WPARAM)end, (LPARAM)end);
     SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)tmp);
+    SendMessageA(g_log, EM_SCROLLCARET, 0, 0);
     free(tmp);
 }
 
@@ -169,8 +195,38 @@ static void pump_log(void)
 }
 
 /* ── rules view ─────────────────────────────────────────────────────────── */
+static int rule_cmp(const engine_rule_t *a, const engine_rule_t *b)
+{
+    int r;
+    switch (g_rules_sort_col) {
+    case 1:  r = (int)a->vlan_id - (int)b->vlan_id; break;
+    case 2:  r = (a->out_tagged > b->out_tagged) - (a->out_tagged < b->out_tagged); break;
+    case 3:  r = (a->in_stripped > b->in_stripped) - (a->in_stripped < b->in_stripped); break;
+    case 0:
+    default: r = memcmp(a->mac, b->mac, ETH_ALEN); break;
+    }
+    return g_rules_sort_asc ? r : -r;
+}
+
+/* Reorder the underlying rules array (not just the view) so row indices still
+ * map to g_cfg.rules[] for Remove. Only ever called while idle. */
+static void rules_sort(void)
+{
+    if (g_rules_sort_col < 0) return;
+    for (int i = 1; i < g_cfg.n_rules; i++) {
+        engine_rule_t key = g_cfg.rules[i];
+        int j = i - 1;
+        while (j >= 0 && rule_cmp(&g_cfg.rules[j], &key) > 0) {
+            g_cfg.rules[j + 1] = g_cfg.rules[j];
+            j--;
+        }
+        g_cfg.rules[j + 1] = key;
+    }
+}
+
 static void rules_refresh(void)
 {
+    rules_sort();
     SendMessage(g_rules, LVM_DELETEALLITEMS, 0, 0);
     for (int i = 0; i < g_cfg.n_rules; i++) {
         char mac[18], vlan[8], num[24];
@@ -222,38 +278,77 @@ static void rule_add(const uint8_t *mac, uint16_t vlan)
 }
 
 /* ── discovery view ─────────────────────────────────────────────────────── */
+static int disc_cmp(const disc_row_t *a, const disc_row_t *b)
+{
+    int r;
+    switch (g_disc_sort_col) {
+    case 1:  r = memcmp(a->mac, b->mac, ETH_ALEN); break;
+    case 2:  r = memcmp(&a->ip, &b->ip, sizeof(a->ip)); break;  /* net order */
+    case 3:  r = (a->count > b->count) - (a->count < b->count); break;
+    case 0:
+    default: r = (int)a->vlan_id - (int)b->vlan_id; break;
+    }
+    if (r == 0) {                          /* stable tiebreak: VLAN then MAC */
+        r = (int)a->vlan_id - (int)b->vlan_id;
+        if (r == 0) r = memcmp(a->mac, b->mac, ETH_ALEN);
+    }
+    return g_disc_sort_asc ? r : -r;
+}
+
 static void disc_refresh(void)
 {
     int n = engine_discovery_snapshot(g_disc_rows, ENGINE_DISC_MAX);
 
-    /* sort by VLAN then MAC for a stable display */
-    for (int i = 1; i < n; i++) {
+    for (int i = 1; i < n; i++) {                    /* sort by current key */
         disc_row_t key = g_disc_rows[i];
         int j = i - 1;
-        while (j >= 0 &&
-               (g_disc_rows[j].vlan_id > key.vlan_id ||
-                (g_disc_rows[j].vlan_id == key.vlan_id &&
-                 memcmp(g_disc_rows[j].mac, key.mac, ETH_ALEN) > 0))) {
+        while (j >= 0 && disc_cmp(&g_disc_rows[j], &key) > 0) {
             g_disc_rows[j + 1] = g_disc_rows[j];
             j--;
         }
         g_disc_rows[j + 1] = key;
     }
 
-    SendMessage(g_disc, LVM_DELETEALLITEMS, 0, 0);
-    for (int i = 0; i < n; i++) {
-        char vlan[8], mac[18], ip[16], num[24];
-        const uint8_t *b = (const uint8_t *)&g_disc_rows[i].ip;
-        snprintf(vlan, sizeof(vlan), "%u", g_disc_rows[i].vlan_id);
-        engine_format_mac(g_disc_rows[i].mac, mac, sizeof(mac));
-        snprintf(ip, sizeof(ip), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
-        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_disc_rows[i].count);
-        lv_add_row(g_disc, i, vlan);
-        lv_set(g_disc, i, 1, mac);
-        lv_set(g_disc, i, 2, ip);
-        lv_set(g_disc, i, 3, num);
+    /* Fast path: same devices in the same order as last tick — only the packet
+     * counts can differ, so patch those cells in place. Deleting and rebuilding
+     * every 250 ms is what made the list flicker and drop the selection. */
+    int same = (n == g_disc_prev_n);
+    for (int i = 0; same && i < n; i++)
+        if (g_disc_rows[i].vlan_id != g_disc_prev[i].vlan_id ||
+            g_disc_rows[i].ip      != g_disc_prev[i].ip      ||
+            memcmp(g_disc_rows[i].mac, g_disc_prev[i].mac, ETH_ALEN) != 0)
+            same = 0;
+
+    if (same) {
+        for (int i = 0; i < n; i++)
+            if (g_disc_rows[i].count != g_disc_prev[i].count) {
+                char num[24];
+                snprintf(num, sizeof(num), "%llu",
+                         (unsigned long long)g_disc_rows[i].count);
+                lv_set(g_disc, i, 3, num);
+            }
+    } else {
+        SendMessage(g_disc, WM_SETREDRAW, (WPARAM)FALSE, 0);
+        SendMessage(g_disc, LVM_DELETEALLITEMS, 0, 0);
+        for (int i = 0; i < n; i++) {
+            char vlan[8], mac[18], ip[16], num[24];
+            const uint8_t *b = (const uint8_t *)&g_disc_rows[i].ip;
+            snprintf(vlan, sizeof(vlan), "%u", g_disc_rows[i].vlan_id);
+            engine_format_mac(g_disc_rows[i].mac, mac, sizeof(mac));
+            snprintf(ip, sizeof(ip), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+            snprintf(num, sizeof(num), "%llu", (unsigned long long)g_disc_rows[i].count);
+            lv_add_row(g_disc, i, vlan);
+            lv_set(g_disc, i, 1, mac);
+            lv_set(g_disc, i, 2, ip);
+            lv_set(g_disc, i, 3, num);
+        }
+        SendMessage(g_disc, WM_SETREDRAW, (WPARAM)TRUE, 0);
+        InvalidateRect(g_disc, NULL, FALSE);
     }
-    g_disc_shown = n;
+
+    memcpy(g_disc_prev, g_disc_rows, sizeof(disc_row_t) * (size_t)n);
+    g_disc_prev_n = n;
+    g_disc_shown  = n;
 }
 
 /* ── stats label ────────────────────────────────────────────────────────── */
@@ -376,6 +471,34 @@ static void on_remove_rule(void)
     rules_refresh();
 }
 
+static void on_toggle_disc(void)
+{
+    /* Collapsing hides the Scan button, so end any running scan first. */
+    if (!g_disc_collapsed && g_state == ST_SCANNING) engine_stop();
+    g_disc_collapsed = !g_disc_collapsed;
+    SetWindowTextA(g_disc_toggle, g_disc_collapsed ? "Show" : "Hide");
+    RECT rc; GetClientRect(g_main, &rc);
+    layout(rc.right, rc.bottom);
+}
+
+static void on_disc_colclick(int col)
+{
+    if (col < 0 || col > 3) return;
+    if (col == g_disc_sort_col) g_disc_sort_asc = !g_disc_sort_asc;
+    else { g_disc_sort_col = col; g_disc_sort_asc = 1; }
+    g_disc_prev_n = 0;                    /* force a rebuild in the new order */
+    disc_refresh();
+}
+
+static void on_rules_colclick(int col)
+{
+    /* The worker reads g_cfg.rules[] while bridging; only reorder when idle. */
+    if (g_state != ST_IDLE || col < 0 || col > 3) return;
+    if (col == g_rules_sort_col) g_rules_sort_asc = !g_rules_sort_asc;
+    else { g_rules_sort_col = col; g_rules_sort_asc = 1; }
+    rules_refresh();
+}
+
 static void on_start(void)
 {
     if (g_state == ST_BRIDGING) { engine_stop(); return; }  /* thread posts DONE */
@@ -450,16 +573,29 @@ static void layout(int cw, int ch)
     MoveWindow(g_lbl_iface, x, y, iflbl_w, combo_h, TRUE);
     y += combo_h + GAP;
 
-    /* discovery controls */
-    MoveWindow(g_scan,   x,            y, S(96),  BTN_H, TRUE);
-    MoveWindow(g_addsel, x + S(96+8),  y, S(190), BTN_H, TRUE);
-    y += BTN_H + SGAP;
+    /* discovery header: caption on the left, collapse toggle on the right */
+    const int HDR_H = S(22);
+    const int tog_w = S(64);
+    MoveWindow(g_lbl_disc,    x,             y, w - tog_w - S(8), HDR_H, TRUE);
+    MoveWindow(g_disc_toggle, x + w - tog_w, y, tog_w,            HDR_H, TRUE);
+    y += HDR_H + LGAP;
 
-    MoveWindow(g_lbl_disc, x, y, w, LBL_H, TRUE);
-    y += LBL_H + LGAP;
-    MoveWindow(g_disc, x, y, w, S(126), TRUE);
-    lv_fill_last_col(g_disc, 4);
-    y += S(126) + SGAP;
+    /* discovery body (scan buttons + list) — hidden when collapsed, freeing
+     * its vertical space for the log pane below */
+    const int show = !g_disc_collapsed;
+    ShowWindow(g_scan,   show ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_addsel, show ? SW_SHOW : SW_HIDE);
+    ShowWindow(g_disc,   show ? SW_SHOW : SW_HIDE);
+    if (show) {
+        MoveWindow(g_scan,   x,           y, S(96),  BTN_H, TRUE);
+        MoveWindow(g_addsel, x + S(96+8), y, S(190), BTN_H, TRUE);
+        y += BTN_H + GAP;
+        MoveWindow(g_disc, x, y, w, S(126), TRUE);
+        lv_fill_last_col(g_disc, 4);
+        y += S(126) + SGAP;
+    } else {
+        y += SGAP;
+    }
 
     /* rules section */
     MoveWindow(g_lbl_rules, x, y, w, LBL_H, TRUE);
@@ -527,7 +663,10 @@ static void create_controls(HWND w)
     g_addsel = mk("BUTTON", "Add Se&lected -> Rules",
                   BS_PUSHBUTTON | WS_TABSTOP, IDC_ADD_SEL_BTN, w);
 
-    g_lbl_disc = mk("STATIC", "Discovered devices", SS_LEFT, -1, w);
+    g_lbl_disc = mk("STATIC", "Discovered devices",
+                    SS_LEFT | SS_CENTERIMAGE, -1, w);
+    g_disc_toggle = mk("BUTTON", "Hide",
+                       BS_PUSHBUTTON | WS_TABSTOP, IDC_DISC_TOGGLE, w);
     /* WS_EX_CLIENTEDGE, not WS_BORDER: a themed border drawn via WS_BORDER
      * wraps only the client area, leaving any scrollbar outside the frame. */
     g_disc = mk_ex(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
@@ -572,6 +711,9 @@ static void create_controls(HWND w)
                       ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL |
                       WS_TABSTOP,
                       IDC_LOG_EDIT, w);
+    /* Lift the edit control's default text cap (~30 KB) so appends don't
+     * silently stop; log_append() trims the oldest lines instead. */
+    SendMessageA(g_log, EM_SETLIMITTEXT, 0, 0);
 }
 
 static void populate_ifaces(void)
@@ -634,6 +776,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_ADD_RULE_BTN: on_add_rule();    return 0;
         case IDC_REMOVE_BTN:   on_remove_rule(); return 0;
         case IDC_START_BTN:    on_start();       return 0;
+        case IDC_DISC_TOGGLE:  on_toggle_disc(); return 0;
         }
         return 0;
 
@@ -641,6 +784,12 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         LPNMHDR nh = (LPNMHDR)lp;
         if (nh->idFrom == IDC_DISC_LIST && nh->code == NM_DBLCLK) {
             on_add_selected();
+            return 0;
+        }
+        if (nh->code == LVN_COLUMNCLICK) {
+            int col = ((LPNMLISTVIEW)lp)->iSubItem;
+            if (nh->idFrom == IDC_DISC_LIST)  on_disc_colclick(col);
+            else if (nh->idFrom == IDC_RULES_LIST) on_rules_colclick(col);
             return 0;
         }
         break;
