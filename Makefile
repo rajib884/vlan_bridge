@@ -47,21 +47,35 @@ SDK_URL      ?= https://npcap.com/dist/npcap-sdk-$(SDK_VERSION).zip
 # Lib subdir: x64 | ARM64 | (empty for 32-bit, whose import libs sit in Lib/).
 SDK_ARCH     ?= x64
 
+# wpcap is linked DELAY-loaded, not directly: Npcap keeps wpcap.dll in
+# System32\Npcap, which is off the default DLL search path, so a normal import
+# makes the loader fail before main() runs. The delay-import library below is
+# generated from wpcap_delay.def; engine_load_npcap() loads the real DLL by
+# absolute path before the first pcap call. -ldelayimp supplies the helper.
+DLLTOOL    ?= x86_64-w64-mingw32-dlltool
+DELAY_DEF   = wpcap_delay.def
+DELAY_LIB   = libwpcap_delay.a
+
 INCLUDES  = -I"$(SDK)/Include"
-LIBS      = -L"$(SDK)/Lib/$(SDK_ARCH)" -lwpcap -lws2_32 -liphlpapi
+LIBS      = -L. -lwpcap_delay -ldelayimp -lws2_32 -liphlpapi
 
 # ── targets ─────────────────────────────────────────────────────────────────
 .PHONY: all gui sdk clean distclean
 
 all: $(TARGET)
 
-$(TARGET): $(SRCS) $(HDRS) | $(SDK)
+# Delay-import library for wpcap.dll. Built from a checked-in .def so this
+# works when cross-compiling too (no wpcap.dll present on the build host).
+$(DELAY_LIB): $(DELAY_DEF)
+	$(DLLTOOL) -d $(DELAY_DEF) -y $@
+
+$(TARGET): $(SRCS) $(HDRS) $(DELAY_LIB) | $(SDK)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(INCLUDES) $(LIBS)
 
 # GUI: compile the manifest resource, then link the Win32 front-end.
 gui: $(GUI_TARGET)
 
-$(GUI_TARGET): $(GUI_SRCS) $(GUI_RC) vlan_bridge_gui.manifest $(HDRS) | $(SDK)
+$(GUI_TARGET): $(GUI_SRCS) $(GUI_RC) vlan_bridge_gui.manifest $(HDRS) $(DELAY_LIB) | $(SDK)
 	$(WINDRES) $(WINDRESFLAGS) $(GUI_RC) -O coff -o gui_res.o
 	$(CC) $(CFLAGS) -mwindows -o $@ $(GUI_SRCS) gui_res.o $(INCLUDES) $(LIBS) $(GUI_LIBS)
 	rm -f gui_res.o
@@ -77,7 +91,7 @@ $(SDK):
 	rm -f npcap-sdk.zip
 
 clean:
-	rm -f $(TARGET) $(GUI_TARGET) gui_res.o
+	rm -f $(TARGET) $(GUI_TARGET) gui_res.o $(DELAY_LIB)
 
 distclean: clean
 	rm -rf $(SDK) npcap-sdk.zip

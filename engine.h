@@ -70,6 +70,12 @@ typedef struct {
 /* ── lifecycle ──────────────────────────────────────────────────────────── */
 void engine_init(void);      /* call once at startup (inits internal lock)     */
 
+/* Load Npcap's wpcap.dll. Must be called (and must succeed) before any other
+ * engine call that touches pcap; wpcap is delay-loaded, so calling pcap with
+ * the DLL missing would terminate the process in the delay-load helper.
+ * Returns 0 on success, -1 if Npcap is not installed.                        */
+int  engine_load_npcap(void);
+
 /* ── helpers ────────────────────────────────────────────────────────────── */
 int  engine_parse_mac(const char *s, uint8_t *mac);              /* 0 = ok     */
 void engine_format_mac(const uint8_t *mac, char *buf, size_t sz);/* "AA:BB:.." */

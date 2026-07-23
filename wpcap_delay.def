@@ -1,0 +1,29 @@
+;
+; wpcap_delay.def — export list used to build a DELAY-import library for
+; wpcap.dll (see the Makefile's libwpcap_delay.a rule).
+;
+; Why delay loading: Npcap installs wpcap.dll into %SystemRoot%\System32\Npcap,
+; which is not on the default DLL search path. With a normal import the loader
+; resolves wpcap before main() runs and the process dies with
+; "wpcap.dll: cannot open shared object file" unless Npcap was installed in
+; WinPcap-compatible mode. Delay loading defers that to the first pcap call,
+; which lets engine_load_npcap() load the DLL by absolute path first.
+;
+; Only the entry points this project actually calls need to be listed. Add a
+; name here if you start using a new pcap_* function.
+;
+LIBRARY wpcap.dll
+EXPORTS
+pcap_breakloop
+pcap_close
+pcap_compile
+pcap_datalink
+pcap_findalldevs
+pcap_freealldevs
+pcap_freecode
+pcap_geterr
+pcap_lib_version
+pcap_loop
+pcap_open_live
+pcap_sendpacket
+pcap_setfilter

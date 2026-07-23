@@ -87,6 +87,32 @@ void engine_init(void)
     memset(&g_disc, 0, sizeof(g_disc));
 }
 
+/* Npcap installs wpcap.dll into %SystemRoot%\System32\Npcap, which is NOT on
+ * the default DLL search path — only a "WinPcap API-compatible mode" install
+ * drops a copy in System32. wpcap is therefore linked delay-loaded (see the
+ * Makefile) so nothing resolves until the first pcap call, and we load it here
+ * by absolute path first. LOAD_WITH_ALTERED_SEARCH_PATH makes wpcap's own
+ * dependency (Packet.dll) resolve from that same directory. Once the module is
+ * in the process, the delay-load helper's LoadLibrary("wpcap.dll") finds it by
+ * name and binds against it. */
+int engine_load_npcap(void)
+{
+    char path[MAX_PATH];
+    UINT n = GetSystemDirectoryA(path, MAX_PATH);
+
+    if (n > 0 && n < MAX_PATH - sizeof("\\Npcap\\wpcap.dll")) {
+        memcpy(path + n, "\\Npcap\\wpcap.dll", sizeof("\\Npcap\\wpcap.dll"));
+        if (LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH))
+            return 0;
+    }
+    /* Fall back to the normal search order: covers WinPcap-compatible installs
+     * (System32\wpcap.dll) and anything already on PATH. */
+    if (LoadLibraryA("wpcap.dll"))
+        return 0;
+
+    return -1;
+}
+
 /* ── small helpers ──────────────────────────────────────────────────────── */
 int engine_parse_mac(const char *str, uint8_t *mac)
 {

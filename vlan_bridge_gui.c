@@ -44,7 +44,14 @@ enum { ST_IDLE = 0, ST_SCANNING, ST_BRIDGING };
 /* ── globals ────────────────────────────────────────────────────────────── */
 static HWND g_main, g_iface, g_scan, g_disc, g_addsel, g_macedit, g_vlanedit;
 static HWND g_addrule, g_remove, g_rules, g_start, g_verbose, g_stats, g_log;
+static HWND g_lbl_iface, g_lbl_disc, g_lbl_rules, g_lbl_log;
 static HFONT g_font;
+static HBRUSH g_bg;            /* window/static background, matches the class  */
+static int    g_dpi = 96;
+
+/* All layout constants below are in 96-DPI logical pixels; S() maps them to
+ * device pixels so the window is laid out correctly on scaled displays. */
+#define S(x) MulDiv((x), g_dpi, 96)
 
 static iface_info_t g_ifaces[ENGINE_MAX_IFACES];
 static int          g_n_ifaces;
@@ -58,6 +65,27 @@ static int    g_state  = ST_IDLE;
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 static void set_font(HWND h) { if (g_font) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
+
+/* Pick up the shell's DPI and its UI font (Segoe UI on Vista+) instead of
+ * DEFAULT_GUI_FONT, which is the ancient bitmap font and never scales. */
+static void ui_metrics_init(void)
+{
+    HDC dc = GetDC(NULL);
+    if (dc) {
+        g_dpi = GetDeviceCaps(dc, LOGPIXELSX);
+        ReleaseDC(NULL, dc);
+    }
+    if (g_dpi <= 0) g_dpi = 96;
+
+    NONCLIENTMETRICSA ncm;
+    ncm.cbSize = sizeof(ncm);
+    if (SystemParametersInfoA(SPI_GETNONCLIENTMETRICS, sizeof(ncm), &ncm, 0))
+        g_font = CreateFontIndirectA(&ncm.lfMessageFont);
+    if (!g_font)
+        g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    g_bg = GetSysColorBrush(COLOR_BTNFACE);
+}
 
 static void lv_add_col(HWND lv, int i, const char *title, int width)
 {
@@ -91,6 +119,21 @@ static void lv_set(HWND lv, int row, int col, const char *text)
 static int lv_selected(HWND lv)
 {
     return (int)SendMessage(lv, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+}
+
+/* Stretch a report-view's last column so the header fills the control instead
+ * of leaving a blank stub to the right of the final column. */
+static void lv_fill_last_col(HWND lv, int n_cols)
+{
+    RECT rc;
+    GetClientRect(lv, &rc);
+    int used = 0;
+    for (int i = 0; i < n_cols - 1; i++)
+        used += (int)SendMessage(lv, LVM_GETCOLUMNWIDTH, (WPARAM)i, 0);
+
+    int last = (rc.right - rc.left) - used - GetSystemMetrics(SM_CXVSCROLL);
+    if (last < S(60)) last = S(60);
+    SendMessage(lv, LVM_SETCOLUMNWIDTH, (WPARAM)(n_cols - 1), (LPARAM)last);
 }
 
 /* Append raw log bytes (may contain '\n') to the read-only edit, converting to
@@ -378,73 +421,156 @@ static void worker_done(void)
 }
 
 /* ── layout ─────────────────────────────────────────────────────────────── */
+/*
+ * Single top-to-bottom flow: every row advances a running `y`, so rows can
+ * never drift out of alignment and there is no dead space between sections.
+ * Widths key off the client width; the log pane absorbs all leftover height.
+ */
 static void layout(int cw, int ch)
 {
-    const int m = 10;
-    MoveWindow(g_iface,   85, 10, cw - 95, 200, TRUE);
-    MoveWindow(g_scan,    m, 44, 90, 26, TRUE);
-    MoveWindow(g_addsel,  110, 44, 180, 26, TRUE);
-    MoveWindow(g_disc,    m, 78, cw - 2*m, 130, TRUE);
-    MoveWindow(g_macedit, m, 246, 150, 24, TRUE);
-    MoveWindow(g_vlanedit,170, 246, 60, 24, TRUE);
-    MoveWindow(g_addrule, 240, 245, 100, 26, TRUE);
-    MoveWindow(g_remove,  348, 245, 110, 26, TRUE);
-    MoveWindow(g_rules,   m, 278, cw - 2*m, 110, TRUE);
-    MoveWindow(g_start,   m, 398, 100, 28, TRUE);
-    MoveWindow(g_verbose, 120, 402, 130, 20, TRUE);
-    MoveWindow(g_stats,   260, 402, cw - 270, 20, TRUE);
-    MoveWindow(g_log,     m, 434, cw - 2*m, ch - 444, TRUE);
+    const int M     = S(11);   /* outer margin                                */
+    const int GAP   = S(8);    /* between rows inside a section               */
+    const int SGAP  = S(14);   /* between sections                            */
+    const int LBL_H = S(16);   /* section caption                             */
+    const int CTL_H = S(23);   /* edit / combo row height                     */
+    const int BTN_H = S(26);
+    const int LGAP  = S(3);    /* caption to the control it labels            */
+
+    const int x = M;
+    const int w = cw - 2 * M;
+    int y = M;
+
+    /* interface row — caption is vertically centred against the combo */
+    const int iflbl_w = S(62);
+    MoveWindow(g_iface, x + iflbl_w + S(6), y, w - iflbl_w - S(6), S(220), TRUE);
+    RECT rc;
+    GetWindowRect(g_iface, &rc);              /* closed height, font-dependent */
+    int combo_h = rc.bottom - rc.top;
+    MoveWindow(g_lbl_iface, x, y, iflbl_w, combo_h, TRUE);
+    y += combo_h + GAP;
+
+    /* discovery controls */
+    MoveWindow(g_scan,   x,            y, S(96),  BTN_H, TRUE);
+    MoveWindow(g_addsel, x + S(96+8),  y, S(190), BTN_H, TRUE);
+    y += BTN_H + SGAP;
+
+    MoveWindow(g_lbl_disc, x, y, w, LBL_H, TRUE);
+    y += LBL_H + LGAP;
+    MoveWindow(g_disc, x, y, w, S(126), TRUE);
+    lv_fill_last_col(g_disc, 4);
+    y += S(126) + SGAP;
+
+    /* rules section */
+    MoveWindow(g_lbl_rules, x, y, w, LBL_H, TRUE);
+    y += LBL_H + LGAP;
+
+    /* edits are CTL_H, buttons BTN_H — centre them on a shared baseline */
+    const int row_h = BTN_H;
+    const int ey    = y + (row_h - CTL_H) / 2;
+    int bx = x;
+    MoveWindow(g_macedit,  bx, ey, S(150), CTL_H, TRUE);  bx += S(150 + 8);
+    MoveWindow(g_vlanedit, bx, ey, S(64),  CTL_H, TRUE);  bx += S(64 + 8);
+    MoveWindow(g_addrule,  bx, y,  S(100), BTN_H, TRUE);  bx += S(100 + 8);
+    MoveWindow(g_remove,   bx, y,  S(110), BTN_H, TRUE);
+    y += row_h + GAP;
+
+    MoveWindow(g_rules, x, y, w, S(112), TRUE);
+    lv_fill_last_col(g_rules, 4);
+    y += S(112) + SGAP;
+
+    /* run row: Start + verbose checkbox, both centred on the button */
+    const int chk_h = S(20);
+    MoveWindow(g_start,   x, y, S(100), S(28), TRUE);
+    MoveWindow(g_verbose, x + S(100 + 12), y + (S(28) - chk_h) / 2, S(120), chk_h, TRUE);
+    y += S(28) + GAP;
+
+    /* stats gets a full-width line of its own — the string is long and was
+     * being clipped when it shared the run row */
+    MoveWindow(g_stats, x, y, w, S(18), TRUE);
+    y += S(18) + SGAP;
+
+    MoveWindow(g_lbl_log, x, y, w, LBL_H, TRUE);
+    y += LBL_H + LGAP;
+
+    int log_h = ch - y - M;
+    if (log_h < S(60)) log_h = S(60);
+    MoveWindow(g_log, x, y, w, log_h, TRUE);
 }
 
 /* ── window creation ────────────────────────────────────────────────────── */
-static HWND mk(const char *cls, const char *text, DWORD style, int id, HWND parent)
+static HWND mk_ex(DWORD exstyle, const char *cls, const char *text, DWORD style,
+                  int id, HWND parent)
 {
-    HWND h = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+    HWND h = CreateWindowExA(exstyle, cls, text, WS_CHILD | WS_VISIBLE | style,
                              0, 0, 10, 10, parent, (HMENU)(INT_PTR)id,
                              GetModuleHandle(NULL), NULL);
     set_font(h);
     return h;
 }
 
+static HWND mk(const char *cls, const char *text, DWORD style, int id, HWND parent)
+{
+    return mk_ex(0, cls, text, style, id, parent);
+}
+
+
 static void create_controls(HWND w)
 {
-    /* interface label */
-    HWND lbl = mk("STATIC", "Interface:", SS_LEFT, -1, w);
-    MoveWindow(lbl, 10, 13, 70, 18, TRUE);
+    /* SS_CENTERIMAGE vertically centres the caption inside its rect, so a
+     * label sitting next to a taller control lines up on the text baseline. */
+    g_lbl_iface = mk("STATIC", "Interface:", SS_LEFT | SS_CENTERIMAGE, -1, w);
 
-    g_iface  = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_IFACE_COMBO, w);
-    g_scan   = mk("BUTTON", "Scan", BS_PUSHBUTTON, IDC_SCAN_BTN, w);
-    g_addsel = mk("BUTTON", "Add Selected -> Rules", BS_PUSHBUTTON, IDC_ADD_SEL_BTN, w);
+    g_iface  = mk("COMBOBOX", "",
+                  CBS_DROPDOWNLIST | WS_VSCROLL | WS_TABSTOP, IDC_IFACE_COMBO, w);
+    g_scan   = mk("BUTTON", "&Scan", BS_PUSHBUTTON | WS_TABSTOP, IDC_SCAN_BTN, w);
+    g_addsel = mk("BUTTON", "Add Se&lected -> Rules",
+                  BS_PUSHBUTTON | WS_TABSTOP, IDC_ADD_SEL_BTN, w);
 
-    g_disc = mk(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL, IDC_DISC_LIST, w);
+    g_lbl_disc = mk("STATIC", "Discovered devices", SS_LEFT, -1, w);
+    /* WS_EX_CLIENTEDGE, not WS_BORDER: a themed border drawn via WS_BORDER
+     * wraps only the client area, leaving any scrollbar outside the frame. */
+    g_disc = mk_ex(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
+                   LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP, IDC_DISC_LIST, w);
     SendMessage(g_disc, LVM_SETEXTENDEDLISTVIEWSTYLE,
-                LVS_EX_FULLROWSELECT, LVS_EX_FULLROWSELECT);
-    lv_add_col(g_disc, 0, "VLAN", 60);
-    lv_add_col(g_disc, 1, "MAC", 150);
-    lv_add_col(g_disc, 2, "IP", 130);
-    lv_add_col(g_disc, 3, "pkts", 70);
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER,
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    lv_add_col(g_disc, 0, "VLAN", S(60));
+    lv_add_col(g_disc, 1, "MAC",  S(160));
+    lv_add_col(g_disc, 2, "IP",   S(140));
+    lv_add_col(g_disc, 3, "pkts", S(80));
 
-    g_macedit  = mk("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, IDC_MAC_EDIT, w);
-    SendMessageA(g_macedit, EM_SETCUEBANNER, TRUE, (LPARAM)L"AA:BB:CC:DD:EE:FF");
-    g_vlanedit = mk("EDIT", "", ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER, IDC_VLAN_EDIT, w);
-    SendMessageA(g_vlanedit, EM_SETCUEBANNER, TRUE, (LPARAM)L"VLAN");
-    g_addrule  = mk("BUTTON", "Add Rule", BS_PUSHBUTTON, IDC_ADD_RULE_BTN, w);
-    g_remove   = mk("BUTTON", "Remove Rule", BS_PUSHBUTTON, IDC_REMOVE_BTN, w);
+    g_lbl_rules = mk("STATIC", "Rules  (target MAC -> VLAN)", SS_LEFT, -1, w);
 
-    g_rules = mk(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL, IDC_RULES_LIST, w);
+    g_macedit  = mk("EDIT", "",
+                    ES_AUTOHSCROLL | WS_BORDER | WS_TABSTOP, IDC_MAC_EDIT, w);
+    g_vlanedit = mk("EDIT", "",
+                    ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER | WS_TABSTOP, IDC_VLAN_EDIT, w);
+    /* EM_SETCUEBANNER is Unicode-only — it must go through SendMessageW. */
+    SendMessageW(g_macedit,  EM_SETCUEBANNER, TRUE, (LPARAM)L"AA:BB:CC:DD:EE:FF");
+    SendMessageW(g_vlanedit, EM_SETCUEBANNER, TRUE, (LPARAM)L"VLAN");
+    g_addrule  = mk("BUTTON", "Add &Rule",   BS_PUSHBUTTON | WS_TABSTOP, IDC_ADD_RULE_BTN, w);
+    g_remove   = mk("BUTTON", "Re&move Rule", BS_PUSHBUTTON | WS_TABSTOP, IDC_REMOVE_BTN, w);
+
+    g_rules = mk_ex(WS_EX_CLIENTEDGE, WC_LISTVIEWA, "",
+                    LVS_REPORT | LVS_SINGLESEL | WS_TABSTOP, IDC_RULES_LIST, w);
     SendMessage(g_rules, LVM_SETEXTENDEDLISTVIEWSTYLE,
-                LVS_EX_FULLROWSELECT, LVS_EX_FULLROWSELECT);
-    lv_add_col(g_rules, 0, "Target MAC", 170);
-    lv_add_col(g_rules, 1, "VLAN", 60);
-    lv_add_col(g_rules, 2, "Out", 90);
-    lv_add_col(g_rules, 3, "In", 90);
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER,
+                LVS_EX_FULLROWSELECT | LVS_EX_GRIDLINES | LVS_EX_DOUBLEBUFFER);
+    lv_add_col(g_rules, 0, "Target MAC", S(180));
+    lv_add_col(g_rules, 1, "VLAN", S(60));
+    lv_add_col(g_rules, 2, "Out",  S(100));
+    lv_add_col(g_rules, 3, "In",   S(100));
 
-    g_start   = mk("BUTTON", "Start", BS_DEFPUSHBUTTON, IDC_START_BTN, w);
-    g_verbose = mk("BUTTON", "Verbose log", BS_AUTOCHECKBOX, IDC_VERBOSE_CHK, w);
-    g_stats   = mk("STATIC", "", SS_LEFT, IDC_STATS_LBL, w);
-    g_log     = mk("EDIT", "",
-                   ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
-                   IDC_LOG_EDIT, w);
+    g_start   = mk("BUTTON", "Start", BS_DEFPUSHBUTTON | WS_TABSTOP, IDC_START_BTN, w);
+    g_verbose = mk("BUTTON", "&Verbose log",
+                   BS_AUTOCHECKBOX | WS_TABSTOP, IDC_VERBOSE_CHK, w);
+    g_stats   = mk("STATIC", "", SS_LEFT | SS_ENDELLIPSIS, IDC_STATS_LBL, w);
+
+    g_lbl_log = mk("STATIC", "Log", SS_LEFT, -1, w);
+    g_log     = mk_ex(WS_EX_CLIENTEDGE, "EDIT", "",
+                      ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL |
+                      WS_TABSTOP,
+                      IDC_LOG_EDIT, w);
 }
 
 static void populate_ifaces(void)
@@ -453,7 +579,8 @@ static void populate_ifaces(void)
     SendMessage(g_iface, CB_RESETCONTENT, 0, 0);
     for (int i = 0; i < g_n_ifaces; i++) {
         char line[400];
-        snprintf(line, sizeof(line), "%s  [%s]",
+        /* explicit precisions: the ternaries defeat gcc's truncation analysis */
+        snprintf(line, sizeof(line), "%.320s  [%.16s]",
                  g_ifaces[i].friendly[0] ? g_ifaces[i].friendly : g_ifaces[i].npf_name,
                  g_ifaces[i].ip[0] ? g_ifaces[i].ip : "no ip");
         SendMessageA(g_iface, CB_ADDSTRING, 0, (LPARAM)line);
@@ -469,6 +596,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         create_controls(w);
         populate_ifaces();
         ui_set_state(ST_IDLE);
+        stats_refresh();      /* show zeroed counters rather than a blank line */
         SetTimer(w, TIMER_ID, TIMER_MS, NULL);
         return 0;
 
@@ -478,10 +606,25 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_GETMINMAXINFO: {
         MINMAXINFO *mmi = (MINMAXINFO *)lp;
-        mmi->ptMinTrackSize.x = 620;
-        mmi->ptMinTrackSize.y = 560;
+        /* wide enough for the rule-editor row, tall enough to leave the log
+         * pane usable once every fixed-height section is placed */
+        mmi->ptMinTrackSize.x = S(560);
+        mmi->ptMinTrackSize.y = S(700);
         return 0;
     }
+
+    /* Paint STATIC captions, the checkbox and the stats line on the window's
+     * own background instead of the control default. The log EDIT is read-only
+     * (so it also sends WM_CTLCOLORSTATIC) but must stay a white text field. */
+    case WM_CTLCOLORSTATIC:
+        if ((HWND)lp == g_log) {
+            SetBkColor((HDC)wp, GetSysColor(COLOR_WINDOW));
+            SetTextColor((HDC)wp, GetSysColor(COLOR_WINDOWTEXT));
+            return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        }
+        SetBkMode((HDC)wp, TRANSPARENT);
+        SetTextColor((HDC)wp, GetSysColor(COLOR_BTNTEXT));
+        return (LRESULT)g_bg;
 
     case WM_COMMAND:
         switch (LOWORD(wp)) {
@@ -542,9 +685,18 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     log_set_memory_sink(1);
     engine_init();
 
+    if (engine_load_npcap() != 0) {
+        MessageBoxA(NULL,
+            "Could not load wpcap.dll.\n\n"
+            "Npcap does not appear to be installed. Install it from "
+            "https://npcap.com/ and run this again.",
+            "VLAN Bridge", MB_OK | MB_ICONERROR);
+        return 1;
+    }
+
     INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
     InitCommonControlsEx(&icc);
-    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+    ui_metrics_init();
 
     WNDCLASSA wc; memset(&wc, 0, sizeof(wc));
     wc.lpfnWndProc   = WndProc;
@@ -555,10 +707,12 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
     wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
     if (!RegisterClassA(&wc)) return 1;
 
+    /* ASCII only: the window is created with the -A API, and a UTF-8 em dash
+     * in the source would reach it as mojibake. */
     HWND w = CreateWindowExA(0, wc.lpszClassName,
-        "VLAN Bridge — multi-target",
+        "VLAN Bridge - multi-target",
         WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-        CW_USEDEFAULT, CW_USEDEFAULT, 760, 620,
+        CW_USEDEFAULT, CW_USEDEFAULT, S(780), S(760),
         NULL, NULL, hInst, NULL);
     if (!w) return 1;
 
@@ -572,6 +726,7 @@ int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
         DispatchMessage(&m);
     }
 
+    if (g_font) DeleteObject(g_font);
     log_close();
     return 0;
 }

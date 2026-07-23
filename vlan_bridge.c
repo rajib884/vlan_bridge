@@ -170,6 +170,13 @@ int main(int argc, char *argv[])
 
     log_init(logfile, LOG_INFO);
     engine_init();
+    if (engine_load_npcap() != 0) {
+        log_printf(LOG_ERROR,
+            "Could not load wpcap.dll — is Npcap installed?\n"
+            "Get it from https://npcap.com/\n");
+        log_close();
+        return 1;
+    }
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
     if (do_list) {
@@ -191,10 +198,10 @@ int main(int argc, char *argv[])
         }
         log_printf(LOG_INFO, "Listening... (Ctrl+C to stop)\n\n");
         log_flush();
-        engine_discovery_run(iface, filter_ip, verbose);
-        print_discovery_summary();
+        int rc = engine_discovery_run(iface, filter_ip, verbose);
+        if (rc == 0) print_discovery_summary();
         log_close();
-        return 0;
+        return rc == 0 ? 0 : 1;
     }
 
     /* ── bridge mode ─────────────────────────────────────────────────────── */
@@ -242,7 +249,7 @@ int main(int argc, char *argv[])
     log_printf(LOG_INFO, "\nListening... (Ctrl+C to stop)\n\n");
     log_flush();
 
-    engine_bridge_run(&cfg);
+    if (engine_bridge_run(&cfg) != 0) { log_close(); return 1; }
 
     /* ── stats ───────────────────────────────────────────────────────────── */
     engine_stats_t st;
