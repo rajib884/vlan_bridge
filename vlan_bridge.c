@@ -209,12 +209,22 @@ static int mac_eq(const uint8_t *a, const uint8_t *b)
     return memcmp(a, b, ETH_ALEN) == 0;
 }
 
+/* Extract the adapter GUID ("{...}") from an Npcap device name
+ * ("\Device\NPF_{GUID}"). Returns a pointer into pcap_name, or NULL if the
+ * name has no GUID component. The GUID (with braces) is what IPHLPAPI reports
+ * as an adapter's AdapterName, so it is the key we match both here and in
+ * list_devices(). */
+static const char *pcap_name_to_guid(const char *pcap_name)
+{
+    return pcap_name ? strchr(pcap_name, '{') : NULL;
+}
+
 /* Retrieve the MAC address of the chosen interface via IPHLPAPI */
 static int get_interface_mac(const char *pcap_name, uint8_t *mac)
 {
     /* pcap_name looks like "\Device\NPF_{GUID}" – extract the GUID */
-    const char *brace = strchr(pcap_name, '{');
-    if (!brace) return -1;
+    const char *guid = pcap_name_to_guid(pcap_name);
+    if (!guid) return -1;
 
     IP_ADAPTER_INFO *info_buf = NULL;
     ULONG buf_len = 0;
@@ -231,7 +241,7 @@ static int get_interface_mac(const char *pcap_name, uint8_t *mac)
     int found = 0;
     for (IP_ADAPTER_INFO *a = info_buf; a; a = a->Next) {
         /* AdapterName is the GUID string, e.g. "{XXXXXXXX-...}" */
-        if (_stricmp(a->AdapterName, brace) == 0) {
+        if (_stricmp(a->AdapterName, guid) == 0) {
             log_printf(LOG_INFO, "Selected: %s\n", a->AdapterName);
             memcpy(mac, a->Address, ETH_ALEN);
             found = 1;
@@ -292,7 +302,9 @@ static void list_devices()
         pCurrent = pAddresses;
         for (; pCurrent != NULL; pCurrent = pCurrent->Next) {
             if (pCurrent->OperStatus != IfOperStatusUp) continue;
-            if (pCurrent->PhysicalAddressLength == 6 && strcmp(pCurrent->AdapterName, dev->name + 12) == 0) {
+            const char *guid = pcap_name_to_guid(dev->name);
+            if (pCurrent->PhysicalAddressLength == 6 && guid &&
+                _stricmp(pCurrent->AdapterName, guid) == 0) {
                 pUnicast = pCurrent->FirstUnicastAddress;
                 for (; pUnicast != NULL; pUnicast = pUnicast->Next){
                     if (pUnicast->Address.lpSockaddr->sa_family == AF_INET) break;
@@ -1022,14 +1034,18 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type)
     }
 }
 
+/* Usage goes straight to stderr so it works before the logger is initialised
+ * (argument parsing happens before log_init so -o can choose the log target). */
 static void usage(const char *prog)
 {
-    log_printf(LOG_ERROR,
-        "Usage: %s -i <interface> -t <target_mac> -v <vlan_id>\n"
+    fprintf(stderr,
+        "Usage: %s -i <interface> -t <target_mac> -v <vlan_id> [-o <logfile>] [-d]\n"
         "       %s -l\n\n"
         "  -i   Npcap interface name (e.g. \\Device\\NPF_{GUID})\n"
         "  -t   Target MAC address   (e.g. AA:BB:CC:DD:EE:FF)\n"
         "  -v   VLAN ID              (1-4094)\n"
+        "  -o   Write log to <logfile> instead of stdout\n"
+        "  -d   Verbose: keep per-packet logging during capture\n"
         "  -l   List interfaces and exit\n",
         prog, prog);
 }
@@ -1038,27 +1054,34 @@ int main(int argc, char *argv[])
 {
     char    *iface      = NULL;
     char    *target_str = NULL;
+    char    *logfile    = NULL;
     int      vlan_id    = -1;
     int      do_list    = 0;
-
-    log_init(NULL, LOG_INFO);
+    int      verbose    = 0;
 
     /* ── parse args ──────────────────────────────────────────────────── */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-l") == 0) {
             do_list = 1;
+        } else if (strcmp(argv[i], "-d") == 0) {
+            verbose = 1;
         } else if (strcmp(argv[i], "-i") == 0 && i+1 < argc) {
             iface = argv[++i];
         } else if (strcmp(argv[i], "-t") == 0 && i+1 < argc) {
             target_str = argv[++i];
         } else if (strcmp(argv[i], "-v") == 0 && i+1 < argc) {
             vlan_id = atoi(argv[++i]);
+        } else if (strcmp(argv[i], "-o") == 0 && i+1 < argc) {
+            logfile = argv[++i];
         } else {
             usage(argv[0]);
-            log_flush();
             return 1;
         }
     }
+
+    /* Logger writes to stdout unless -o names a file. Must come after parsing
+     * so -o can pick the target, but before any log_printf below. */
+    log_init(logfile, LOG_INFO);
 
     if (do_list) {
 #if 0
@@ -1066,13 +1089,13 @@ int main(int argc, char *argv[])
 #else
         list_devices();
 #endif
-        log_flush();
+        log_close();
         return 0;
     }
 
     if (!iface || !target_str || vlan_id < 1 || vlan_id > 4094) {
         usage(argv[0]);
-        log_flush();
+        log_close();
         return 1;
     }
 
@@ -1144,7 +1167,10 @@ int main(int argc, char *argv[])
     SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
 
     log_printf(LOG_INFO, "Listening... (Ctrl+C to stop)\n\n");
-    log_set_level(LOG_ERROR);
+    /* Quiet the per-packet INFO logging during capture unless -d was given
+     * (per-packet logging is expensive on a busy link). */
+    if (!verbose)
+        log_set_level(LOG_ERROR);
     log_flush();
 
     /* ── capture loop ────────────────────────────────────────────────── */

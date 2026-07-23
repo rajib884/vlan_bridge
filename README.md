@@ -27,8 +27,8 @@ gcc -o vlan_bridge.exe vlan_bridge.c fast_log.c \
 ## Usage
 
 ```
-vlan_bridge -l                          # list available interfaces
-vlan_bridge -i <iface> -t <mac> -v <vid>  # start bridge
+vlan_bridge -l                                    # list available interfaces
+vlan_bridge -i <iface> -t <mac> -v <vid> [-o log] [-d]  # start bridge
 ```
 
 | Flag | Description |
@@ -36,6 +36,8 @@ vlan_bridge -i <iface> -t <mac> -v <vid>  # start bridge
 | `-i` | Npcap interface name (e.g. `\Device\NPF_{GUID}`) |
 | `-t` | Target MAC address (e.g. `AA:BB:CC:DD:EE:FF`) |
 | `-v` | VLAN ID (1–4094) |
+| `-o` | Write log to the given file instead of stdout |
+| `-d` | Verbose: keep per-packet logging during capture (off by default for throughput) |
 | `-l` | List interfaces and exit |
 
 ## Behavior
