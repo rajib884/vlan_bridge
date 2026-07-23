@@ -1,0 +1,7 @@
+# Build artifacts
+*.exe
+*.o
+
+# Auto-downloaded Npcap SDK (fetched by `make`)
+npcap-sdk/
+npcap-sdk.zip

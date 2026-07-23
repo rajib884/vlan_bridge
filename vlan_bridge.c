@@ -756,10 +756,10 @@ static void fix_checksums_in_tagged_frame(uint8_t *frame, uint32_t frame_len)
 
     uint8_t *ip  = frame + 18;                  /* IP header starts here     */
     uint8_t  ihl = (ip[0] & 0x0f) * 4;
-    if (ihl < 20 || frame_len < 18 + ihl) return;
+    if (ihl < 20 || frame_len < 18u + ihl) return;
 
     uint16_t total_len = (uint16_t)((ip[2] << 8) | ip[3]);
-    if (frame_len < 18 + total_len) return;
+    if (frame_len < 18u + total_len) return;
 
     uint8_t  proto = ip[9];
     uint16_t tlen  = total_len - ihl;           /* transport segment length  */
