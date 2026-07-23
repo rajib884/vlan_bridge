@@ -23,4 +23,12 @@ void log_write(const char *data, int len);                    // Write to ring b
 void log_printf(log_level_t log_level, const char *fmt, ...); // printf-style logging into ring
 void log_flush(void);                                         // Drain from ring buffer to disk
 
+// GUI/memory sink: when enabled, log_flush() no longer writes to disk; instead
+// the caller pulls pending bytes with log_drain() (e.g. into a text control).
+// All ring operations become thread-safe, so a worker thread can log while the
+// UI thread drains. If the ring fills before a drain, the oldest bytes are
+// dropped rather than corrupting the buffer.
+void log_set_memory_sink(int enabled);
+int  log_drain(char *dst, int max_len);   // returns bytes copied (0 if none)
+
 #endif /* FAST_LOG_H */

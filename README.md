@@ -1,13 +1,18 @@
 # VLAN Bridge
 
-A Windows utility that adds 802.1Q VLAN tags to outgoing Ethernet frames and strips them from incoming frames, enabling a non-VLAN-aware machine to communicate over a VLAN trunk port.
+A Windows utility that adds 802.1Q VLAN tags to outgoing Ethernet frames and strips them from incoming frames, enabling a non-VLAN-aware machine to communicate over a VLAN trunk port. Available as a **command-line tool** (`vlan_bridge.exe`) and a **native GUI** (`vlan_bridge_gui.exe`).
+
+It supports **multiple targets at once**: each target MAC is mapped to its own VLAN, and the local machine's broadcasts are replicated into every VLAN in use.
 
 ## How it works
 
-The program sits on an interface via [Npcap](https://npcap.com/) in promiscuous mode, applies a BPF filter to capture only traffic to/from a designated target MAC, and rewrites frames on the fly:
+The program sits on an interface via [Npcap](https://npcap.com/) in promiscuous mode, applies a BPF filter to capture only traffic to/from the configured target MACs, and rewrites frames on the fly:
 
-- **Outgoing unicast/broadcast** – inserts a 4-byte 802.1Q tag (TPID `0x8100`) and fixes IP/TCP/UDP/ICMP checksums that Windows NIC offload leaves zeroed.
-- **Incoming unicast/broadcast** – strips the VLAN tag and re-injects the clean frame so the local OS stack consumes it normally.
+- **Outgoing unicast** – to a target MAC: inserts a 4-byte 802.1Q tag (TPID `0x8100`) with **that target's VLAN**, and fixes IP/TCP/UDP/ICMP checksums that Windows NIC offload leaves zeroed.
+- **Outgoing broadcast** – replicated once per distinct VLAN across all targets.
+- **Incoming unicast/broadcast** – from a target: strips the VLAN tag (when the VID matches that target's rule) and re-injects the clean frame so the local OS stack consumes it normally.
+
+The core lives in `engine.c` (shared by both front-ends); `vlan_bridge.c` is the CLI and `vlan_bridge_gui.c` is the Win32 GUI.
 
 ## Requirements
 
@@ -26,20 +31,35 @@ gcc -o vlan_bridge.exe vlan_bridge.c fast_log.c \
     -lwpcap -lws2_32 -liphlpapi
 ```
 
-Or cross-compile a Windows x64 binary from Linux (fetches the Npcap SDK
+Or cross-compile Windows x64 binaries from Linux (fetches the Npcap SDK
 automatically via the `Makefile`):
 
 ```bash
 sudo apt-get install gcc-mingw-w64-x86-64
-make
+make          # builds the CLI  -> vlan_bridge.exe
+make gui      # builds the GUI  -> vlan_bridge_gui.exe
 ```
 
-## Usage
+## GUI
+
+Run `vlan_bridge_gui.exe` (it requests Administrator via its manifest). One
+window covers the whole workflow:
+
+1. Pick the trunk **interface** from the dropdown.
+2. **Scan** to discover VLAN-tagged devices; double-click a row (or select it and
+   **Add Selected → Rules**) to turn it into a `(MAC → VLAN)` rule.
+3. Or type a MAC + VLAN and **Add Rule**. Build as many rules as you need.
+4. **Start** the bridge. The rules table shows live per-target Out/In counts, the
+   stats line shows aggregate counters, and the log pane streams engine output.
+   **Stop** to edit rules and start again.
+
+## CLI usage
 
 ```
-vlan_bridge -l                                          # list available interfaces
-vlan_bridge -s -i <iface> [-f <ip>] [-o log] [-d]       # discover target MAC + VLAN
-vlan_bridge -i <iface> -t <mac> -v <vid> [-o log] [-d]  # start bridge
+vlan_bridge -l                                           # list interfaces
+vlan_bridge -s -i <iface> [-f <ip>] [-o log] [-d]        # discover MAC + VLAN
+vlan_bridge -i <iface> -t <mac> -v <vid> [-o log] [-d]   # bridge one target
+vlan_bridge -i <iface> -r <mac>:<vid> [-r <mac>:<vid>] ... # bridge multiple targets
 ```
 
 | Flag | Description |
@@ -47,11 +67,18 @@ vlan_bridge -i <iface> -t <mac> -v <vid> [-o log] [-d]  # start bridge
 | `-i` | Npcap interface name (e.g. `\Device\NPF_{GUID}`) |
 | `-t` | Target MAC address (e.g. `AA:BB:CC:DD:EE:FF`) |
 | `-v` | VLAN ID (1–4094) |
+| `-r` | Target rule `<mac>:<vid>`, repeatable — for bridging multiple targets |
 | `-s` | Discovery mode: passively scan tagged ARP/ICMP to find the target MAC and VLAN |
 | `-f` | Discovery IP filter: only report frames with this IP on either side |
 | `-o` | Write log to the given file instead of stdout |
 | `-d` | Verbose: keep per-packet logging during capture (off by default for throughput) |
 | `-l` | List interfaces and exit |
+
+Multiple targets, e.g. two devices on different VLANs:
+
+```
+> vlan_bridge -i \Device\NPF_{GUID} -r AA:BB:CC:DD:EE:01:20 -r AA:BB:CC:DD:EE:02:30
+```
 
 ### Finding the MAC and VLAN (discovery mode)
 
@@ -81,10 +108,10 @@ matching packet instead of just first-seen.
 
 | Direction | Condition | Action |
 |-----------|-----------|--------|
-| Outgoing unicast | src=my MAC, dst=target MAC, no VLAN tag | Insert 802.1Q tag, fix checksums, re-send |
-| Outgoing broadcast | src=my MAC, dst=FF:FF:FF:FF:FF:FF, no VLAN tag | Same as above |
-| Incoming unicast | src=target MAC, dst=my MAC, has VLAN tag | Strip tag, re-inject |
-| Incoming broadcast | src=target MAC, dst=FF:FF:FF:FF:FF:FF, has VLAN tag | Strip tag, re-inject |
+| Outgoing unicast | src=my MAC, dst=a target MAC, no VLAN tag | Insert 802.1Q tag with that target's VLAN, fix checksums, re-send |
+| Outgoing broadcast | src=my MAC, dst=FF:FF:FF:FF:FF:FF, no VLAN tag | Tag + send once per **distinct VLAN** across all rules |
+| Incoming unicast | src=a target MAC, dst=my MAC, tag VID matches that target's rule | Strip tag, re-inject |
+| Incoming broadcast | src=a target MAC, dst=FF:FF:FF:FF:FF:FF, tag VID matches | Strip tag, re-inject |
 | Any other frame | – | Ignored (counted in stats) |
 
 ## Limitations
@@ -92,4 +119,6 @@ matching packet instead of just first-seen.
 - Only handles IPv4 checksums; IPv6 is passed through unchanged.
 - Fragmentation support (DF=0 oversized IP packets) and ICMP Fragmentation Needed (DF=1) are currently stubbed out (`#if 0`).
 - The original untagged outgoing frame also reaches the wire; the target device must ignore it based on the missing VLAN tag.
+- Broadcast replication multiplies local broadcast traffic (one tagged copy per distinct VLAN).
+- Each target MAC maps to exactly one VLAN.
 - Both discovery mode and the bridge's incoming path depend on the NIC delivering 802.1Q tags to Npcap. If the adapter strips tags in hardware (VLAN offload), no tagged frames are seen — disable VLAN offload on the adapter (or enable Npcap's VLAN tag support) if discovery reports nothing.

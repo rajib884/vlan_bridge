@@ -23,10 +23,22 @@
 ifeq ($(origin CC),default)
 CC = x86_64-w64-mingw32-gcc-posix
 endif
+# Resource compiler for the GUI (matches the mingw toolchain prefix).
+WINDRES  ?= x86_64-w64-mingw32-windres
+# windres shells out to a preprocessor; point it at $(CC) explicitly because the
+# bare x86_64-w64-mingw32-gcc symlink is broken on some images.
+WINDRESFLAGS ?= --preprocessor=$(CC) --preprocessor-arg=-E \
+                --preprocessor-arg=-xc --preprocessor-arg=-DRC_INVOKED
 CFLAGS   ?= -O2 -Wall -Wextra
 TARGET   ?= vlan_bridge.exe
-SRCS      = vlan_bridge.c fast_log.c
-HDRS      = fast_log.h
+SRCS      = vlan_bridge.c engine.c fast_log.c
+HDRS      = engine.h fast_log.h
+
+# GUI front-end (native Win32).
+GUI_TARGET ?= vlan_bridge_gui.exe
+GUI_SRCS    = vlan_bridge_gui.c engine.c fast_log.c
+GUI_RC      = vlan_bridge_gui.rc
+GUI_LIBS    = -lcomctl32 -lgdi32 -luser32
 
 # Npcap SDK: location, version, and auto-download URL.
 SDK          ?= npcap-sdk
@@ -39,12 +51,20 @@ INCLUDES  = -I"$(SDK)/Include"
 LIBS      = -L"$(SDK)/Lib/$(SDK_ARCH)" -lwpcap -lws2_32 -liphlpapi
 
 # ── targets ─────────────────────────────────────────────────────────────────
-.PHONY: all sdk clean distclean
+.PHONY: all gui sdk clean distclean
 
 all: $(TARGET)
 
 $(TARGET): $(SRCS) $(HDRS) | $(SDK)
 	$(CC) $(CFLAGS) -o $@ $(SRCS) $(INCLUDES) $(LIBS)
+
+# GUI: compile the manifest resource, then link the Win32 front-end.
+gui: $(GUI_TARGET)
+
+$(GUI_TARGET): $(GUI_SRCS) $(GUI_RC) vlan_bridge_gui.manifest $(HDRS) | $(SDK)
+	$(WINDRES) $(WINDRESFLAGS) $(GUI_RC) -O coff -o gui_res.o
+	$(CC) $(CFLAGS) -mwindows -o $@ $(GUI_SRCS) gui_res.o $(INCLUDES) $(LIBS) $(GUI_LIBS)
+	rm -f gui_res.o
 
 # Download & unpack the Npcap SDK (order-only prereq: runs only if missing).
 sdk: $(SDK)
@@ -57,7 +77,7 @@ $(SDK):
 	rm -f npcap-sdk.zip
 
 clean:
-	rm -f $(TARGET)
+	rm -f $(TARGET) $(GUI_TARGET) gui_res.o
 
 distclean: clean
 	rm -rf $(SDK) npcap-sdk.zip

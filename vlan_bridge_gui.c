@@ -1,0 +1,577 @@
+/*
+ * vlan_bridge_gui.c — native Win32 front-end for the VLAN bridge engine.
+ *
+ * Single window, single process. Capture runs on a worker thread against the
+ * shared engine_config_t; the UI thread refreshes stats/discovery/log on a
+ * timer and never touches pcap directly. Requires Administrator (Npcap) — the
+ * embedded manifest requests elevation.
+ *
+ * Build: see the `gui` target in the Makefile.
+ */
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <commctrl.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdint.h>
+
+#include "engine.h"
+#include "fast_log.h"
+
+/* ── control IDs ────────────────────────────────────────────────────────── */
+#define IDC_IFACE_COMBO   1001
+#define IDC_SCAN_BTN      1002
+#define IDC_DISC_LIST     1003
+#define IDC_ADD_SEL_BTN   1004
+#define IDC_MAC_EDIT      1005
+#define IDC_VLAN_EDIT     1006
+#define IDC_ADD_RULE_BTN  1007
+#define IDC_REMOVE_BTN    1008
+#define IDC_RULES_LIST    1009
+#define IDC_START_BTN     1010
+#define IDC_VERBOSE_CHK   1011
+#define IDC_STATS_LBL     1012
+#define IDC_LOG_EDIT      1013
+
+#define WM_APP_BRIDGE_DONE (WM_APP + 1)
+#define WM_APP_SCAN_DONE   (WM_APP + 2)
+#define TIMER_ID           1
+#define TIMER_MS           250
+
+enum { ST_IDLE = 0, ST_SCANNING, ST_BRIDGING };
+
+/* ── globals ────────────────────────────────────────────────────────────── */
+static HWND g_main, g_iface, g_scan, g_disc, g_addsel, g_macedit, g_vlanedit;
+static HWND g_addrule, g_remove, g_rules, g_start, g_verbose, g_stats, g_log;
+static HFONT g_font;
+
+static iface_info_t g_ifaces[ENGINE_MAX_IFACES];
+static int          g_n_ifaces;
+
+static engine_config_t g_cfg;             /* rules edited by UI, read by worker */
+static disc_row_t      g_disc_rows[ENGINE_DISC_MAX];  /* mirrors disc list order */
+static int             g_disc_shown;
+
+static HANDLE g_worker = NULL;
+static int    g_state  = ST_IDLE;
+
+/* ── helpers ────────────────────────────────────────────────────────────── */
+static void set_font(HWND h) { if (g_font) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
+
+static void lv_add_col(HWND lv, int i, const char *title, int width)
+{
+    LVCOLUMNA c; memset(&c, 0, sizeof(c));
+    c.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_SUBITEM;
+    c.pszText = (char *)title;
+    c.cx = width;
+    c.iSubItem = i;
+    SendMessageA(lv, LVM_INSERTCOLUMNA, i, (LPARAM)&c);
+}
+
+static int lv_add_row(HWND lv, int row, const char *text)
+{
+    LVITEMA it; memset(&it, 0, sizeof(it));
+    it.mask = LVIF_TEXT;
+    it.iItem = row;
+    it.pszText = (char *)text;
+    return (int)SendMessageA(lv, LVM_INSERTITEMA, 0, (LPARAM)&it);
+}
+
+static void lv_set(HWND lv, int row, int col, const char *text)
+{
+    LVITEMA it; memset(&it, 0, sizeof(it));
+    it.mask = LVIF_TEXT;
+    it.iItem = row;
+    it.iSubItem = col;
+    it.pszText = (char *)text;
+    SendMessageA(lv, LVM_SETITEMA, 0, (LPARAM)&it);
+}
+
+static int lv_selected(HWND lv)
+{
+    return (int)SendMessage(lv, LVM_GETNEXTITEM, (WPARAM)-1, LVNI_SELECTED);
+}
+
+/* Append raw log bytes (may contain '\n') to the read-only edit, converting to
+ * CRLF so the multiline control renders newlines. */
+static void log_append(const char *data, int len)
+{
+    /* Keep the control from growing without bound. */
+    if (GetWindowTextLengthA(g_log) > 500000)
+        SetWindowTextA(g_log, "");
+
+    char *tmp = (char *)malloc((size_t)len * 2 + 1);
+    if (!tmp) return;
+    int j = 0;
+    for (int i = 0; i < len; i++) {
+        if (data[i] == '\n') tmp[j++] = '\r';
+        tmp[j++] = data[i];
+    }
+    tmp[j] = '\0';
+
+    int end = GetWindowTextLengthA(g_log);
+    SendMessageA(g_log, EM_SETSEL, (WPARAM)end, (LPARAM)end);
+    SendMessageA(g_log, EM_REPLACESEL, FALSE, (LPARAM)tmp);
+    free(tmp);
+}
+
+static void pump_log(void)
+{
+    char buf[8192];
+    int n;
+    while ((n = log_drain(buf, sizeof(buf))) > 0)
+        log_append(buf, n);
+}
+
+/* ── rules view ─────────────────────────────────────────────────────────── */
+static void rules_refresh(void)
+{
+    SendMessage(g_rules, LVM_DELETEALLITEMS, 0, 0);
+    for (int i = 0; i < g_cfg.n_rules; i++) {
+        char mac[18], vlan[8], num[24];
+        engine_format_mac(g_cfg.rules[i].mac, mac, sizeof(mac));
+        lv_add_row(g_rules, i, mac);
+        snprintf(vlan, sizeof(vlan), "%u", g_cfg.rules[i].vlan_id);
+        lv_set(g_rules, i, 1, vlan);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].out_tagged);
+        lv_set(g_rules, i, 2, num);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].in_stripped);
+        lv_set(g_rules, i, 3, num);
+    }
+}
+
+/* Update just the live counter columns (called on the timer while bridging). */
+static void rules_update_counts(void)
+{
+    for (int i = 0; i < g_cfg.n_rules; i++) {
+        char num[24];
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].out_tagged);
+        lv_set(g_rules, i, 2, num);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_cfg.rules[i].in_stripped);
+        lv_set(g_rules, i, 3, num);
+    }
+}
+
+static int rule_exists(const uint8_t *mac)
+{
+    for (int i = 0; i < g_cfg.n_rules; i++)
+        if (memcmp(g_cfg.rules[i].mac, mac, ETH_ALEN) == 0) return 1;
+    return 0;
+}
+
+static void rule_add(const uint8_t *mac, uint16_t vlan)
+{
+    if (g_cfg.n_rules >= ENGINE_MAX_RULES) {
+        MessageBoxA(g_main, "Rule limit reached.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (rule_exists(mac)) {
+        MessageBoxA(g_main, "That MAC already has a rule.", "vlan_bridge", MB_OK | MB_ICONINFORMATION);
+        return;
+    }
+    engine_rule_t *r = &g_cfg.rules[g_cfg.n_rules++];
+    memset(r, 0, sizeof(*r));
+    memcpy(r->mac, mac, ETH_ALEN);
+    r->vlan_id = vlan;
+    rules_refresh();
+}
+
+/* ── discovery view ─────────────────────────────────────────────────────── */
+static void disc_refresh(void)
+{
+    int n = engine_discovery_snapshot(g_disc_rows, ENGINE_DISC_MAX);
+
+    /* sort by VLAN then MAC for a stable display */
+    for (int i = 1; i < n; i++) {
+        disc_row_t key = g_disc_rows[i];
+        int j = i - 1;
+        while (j >= 0 &&
+               (g_disc_rows[j].vlan_id > key.vlan_id ||
+                (g_disc_rows[j].vlan_id == key.vlan_id &&
+                 memcmp(g_disc_rows[j].mac, key.mac, ETH_ALEN) > 0))) {
+            g_disc_rows[j + 1] = g_disc_rows[j];
+            j--;
+        }
+        g_disc_rows[j + 1] = key;
+    }
+
+    SendMessage(g_disc, LVM_DELETEALLITEMS, 0, 0);
+    for (int i = 0; i < n; i++) {
+        char vlan[8], mac[18], ip[16], num[24];
+        const uint8_t *b = (const uint8_t *)&g_disc_rows[i].ip;
+        snprintf(vlan, sizeof(vlan), "%u", g_disc_rows[i].vlan_id);
+        engine_format_mac(g_disc_rows[i].mac, mac, sizeof(mac));
+        snprintf(ip, sizeof(ip), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+        snprintf(num, sizeof(num), "%llu", (unsigned long long)g_disc_rows[i].count);
+        lv_add_row(g_disc, i, vlan);
+        lv_set(g_disc, i, 1, mac);
+        lv_set(g_disc, i, 2, ip);
+        lv_set(g_disc, i, 3, num);
+    }
+    g_disc_shown = n;
+}
+
+/* ── stats label ────────────────────────────────────────────────────────── */
+static void stats_refresh(void)
+{
+    engine_stats_t s;
+    engine_get_stats(&s);
+    char buf[256];
+    snprintf(buf, sizeof(buf),
+        "OUT tagged %llu  bcast %llu   |   IN stripped %llu  bcast %llu   |   ignored %llu",
+        (unsigned long long)s.out_tagged, (unsigned long long)s.out_bcast,
+        (unsigned long long)s.in_stripped, (unsigned long long)s.in_bcast,
+        (unsigned long long)s.ignored);
+    SetWindowTextA(g_stats, buf);
+}
+
+/* ── worker threads ─────────────────────────────────────────────────────── */
+static DWORD WINAPI bridge_thread(LPVOID p)
+{
+    (void)p;
+    engine_bridge_run(&g_cfg);
+    PostMessage(g_main, WM_APP_BRIDGE_DONE, 0, 0);
+    return 0;
+}
+
+static DWORD WINAPI scan_thread(LPVOID p)
+{
+    char *iface = (char *)p;
+    engine_discovery_run(iface, 0, 0);
+    free(iface);
+    PostMessage(g_main, WM_APP_SCAN_DONE, 0, 0);
+    return 0;
+}
+
+/* ── UI enable/disable per state ────────────────────────────────────────── */
+static void ui_set_state(int state)
+{
+    g_state = state;
+    int idle     = (state == ST_IDLE);
+    int scanning = (state == ST_SCANNING);
+    int bridging = (state == ST_BRIDGING);
+
+    EnableWindow(g_iface,   idle);
+    EnableWindow(g_scan,    idle || scanning);
+    EnableWindow(g_addsel,  idle);
+    EnableWindow(g_macedit, idle);
+    EnableWindow(g_vlanedit,idle);
+    EnableWindow(g_addrule, idle);
+    EnableWindow(g_remove,  idle);
+    EnableWindow(g_verbose, idle);
+    EnableWindow(g_start,   idle || bridging);
+
+    SetWindowTextA(g_scan,  scanning ? "Stop Scan" : "Scan");
+    SetWindowTextA(g_start, bridging ? "Stop"      : "Start");
+}
+
+/* ── actions ────────────────────────────────────────────────────────────── */
+static int selected_iface(iface_info_t **out)
+{
+    int sel = (int)SendMessage(g_iface, CB_GETCURSEL, 0, 0);
+    if (sel < 0 || sel >= g_n_ifaces) return 0;
+    *out = &g_ifaces[sel];
+    return 1;
+}
+
+static void on_scan(void)
+{
+    if (g_state == ST_SCANNING) { engine_stop(); return; }  /* thread posts DONE */
+    if (g_state != ST_IDLE) return;
+    iface_info_t *ifc;
+    if (!selected_iface(&ifc)) {
+        MessageBoxA(g_main, "Select an interface first.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    char *arg = _strdup(ifc->npf_name);
+    if (!arg) return;
+    ui_set_state(ST_SCANNING);
+    g_worker = CreateThread(NULL, 0, scan_thread, arg, 0, NULL);
+    if (!g_worker) { free(arg); ui_set_state(ST_IDLE); }
+}
+
+static void on_add_selected(void)
+{
+    int sel = lv_selected(g_disc);
+    if (sel < 0 || sel >= g_disc_shown) {
+        MessageBoxA(g_main, "Select a discovered device first.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    rule_add(g_disc_rows[sel].mac, g_disc_rows[sel].vlan_id);
+}
+
+static void on_add_rule(void)
+{
+    char macbuf[64], vlanbuf[16];
+    GetWindowTextA(g_macedit, macbuf, sizeof(macbuf));
+    GetWindowTextA(g_vlanedit, vlanbuf, sizeof(vlanbuf));
+
+    uint8_t mac[ETH_ALEN];
+    if (engine_parse_mac(macbuf, mac) != 0) {
+        MessageBoxA(g_main, "Enter a MAC like AA:BB:CC:DD:EE:FF.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    int vid = atoi(vlanbuf);
+    if (vid < 1 || vid > 4094) {
+        MessageBoxA(g_main, "VLAN must be 1-4094.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    rule_add(mac, (uint16_t)vid);
+    SetWindowTextA(g_macedit, "");
+    SetWindowTextA(g_vlanedit, "");
+}
+
+static void on_remove_rule(void)
+{
+    int sel = lv_selected(g_rules);
+    if (sel < 0 || sel >= g_cfg.n_rules) return;
+    for (int i = sel; i < g_cfg.n_rules - 1; i++)
+        g_cfg.rules[i] = g_cfg.rules[i + 1];
+    g_cfg.n_rules--;
+    rules_refresh();
+}
+
+static void on_start(void)
+{
+    if (g_state == ST_BRIDGING) { engine_stop(); return; }  /* thread posts DONE */
+    if (g_state != ST_IDLE) return;
+
+    iface_info_t *ifc;
+    if (!selected_iface(&ifc)) {
+        MessageBoxA(g_main, "Select an interface first.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+    if (g_cfg.n_rules == 0) {
+        MessageBoxA(g_main, "Add at least one (MAC -> VLAN) rule.", "vlan_bridge", MB_OK | MB_ICONWARNING);
+        return;
+    }
+
+    snprintf(g_cfg.iface, sizeof(g_cfg.iface), "%s", ifc->npf_name);
+    if (ifc->has_mac) memcpy(g_cfg.my_mac, ifc->mac, ETH_ALEN);
+    else if (engine_get_interface_mac(ifc->npf_name, g_cfg.my_mac) != 0) {
+        MessageBoxA(g_main, "Could not determine this interface's MAC.", "vlan_bridge", MB_OK | MB_ICONERROR);
+        return;
+    }
+    g_cfg.verbose = (SendMessage(g_verbose, BM_GETCHECK, 0, 0) == BST_CHECKED);
+
+    /* reset per-rule counters for a fresh run */
+    for (int i = 0; i < g_cfg.n_rules; i++)
+        g_cfg.rules[i].out_tagged = g_cfg.rules[i].in_stripped = 0;
+
+    ui_set_state(ST_BRIDGING);
+    g_worker = CreateThread(NULL, 0, bridge_thread, NULL, 0, NULL);
+    if (!g_worker) ui_set_state(ST_IDLE);
+}
+
+static void worker_done(void)
+{
+    if (g_worker) {
+        WaitForSingleObject(g_worker, INFINITE);
+        CloseHandle(g_worker);
+        g_worker = NULL;
+    }
+    pump_log();
+    if (g_state == ST_BRIDGING) { rules_update_counts(); stats_refresh(); }
+    else if (g_state == ST_SCANNING) { disc_refresh(); }
+    ui_set_state(ST_IDLE);
+}
+
+/* ── layout ─────────────────────────────────────────────────────────────── */
+static void layout(int cw, int ch)
+{
+    const int m = 10;
+    MoveWindow(g_iface,   85, 10, cw - 95, 200, TRUE);
+    MoveWindow(g_scan,    m, 44, 90, 26, TRUE);
+    MoveWindow(g_addsel,  110, 44, 180, 26, TRUE);
+    MoveWindow(g_disc,    m, 78, cw - 2*m, 130, TRUE);
+    MoveWindow(g_macedit, m, 246, 150, 24, TRUE);
+    MoveWindow(g_vlanedit,170, 246, 60, 24, TRUE);
+    MoveWindow(g_addrule, 240, 245, 100, 26, TRUE);
+    MoveWindow(g_remove,  348, 245, 110, 26, TRUE);
+    MoveWindow(g_rules,   m, 278, cw - 2*m, 110, TRUE);
+    MoveWindow(g_start,   m, 398, 100, 28, TRUE);
+    MoveWindow(g_verbose, 120, 402, 130, 20, TRUE);
+    MoveWindow(g_stats,   260, 402, cw - 270, 20, TRUE);
+    MoveWindow(g_log,     m, 434, cw - 2*m, ch - 444, TRUE);
+}
+
+/* ── window creation ────────────────────────────────────────────────────── */
+static HWND mk(const char *cls, const char *text, DWORD style, int id, HWND parent)
+{
+    HWND h = CreateWindowExA(0, cls, text, WS_CHILD | WS_VISIBLE | style,
+                             0, 0, 10, 10, parent, (HMENU)(INT_PTR)id,
+                             GetModuleHandle(NULL), NULL);
+    set_font(h);
+    return h;
+}
+
+static void create_controls(HWND w)
+{
+    /* interface label */
+    HWND lbl = mk("STATIC", "Interface:", SS_LEFT, -1, w);
+    MoveWindow(lbl, 10, 13, 70, 18, TRUE);
+
+    g_iface  = mk("COMBOBOX", "", CBS_DROPDOWNLIST | WS_VSCROLL, IDC_IFACE_COMBO, w);
+    g_scan   = mk("BUTTON", "Scan", BS_PUSHBUTTON, IDC_SCAN_BTN, w);
+    g_addsel = mk("BUTTON", "Add Selected -> Rules", BS_PUSHBUTTON, IDC_ADD_SEL_BTN, w);
+
+    g_disc = mk(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL, IDC_DISC_LIST, w);
+    SendMessage(g_disc, LVM_SETEXTENDEDLISTVIEWSTYLE,
+                LVS_EX_FULLROWSELECT, LVS_EX_FULLROWSELECT);
+    lv_add_col(g_disc, 0, "VLAN", 60);
+    lv_add_col(g_disc, 1, "MAC", 150);
+    lv_add_col(g_disc, 2, "IP", 130);
+    lv_add_col(g_disc, 3, "pkts", 70);
+
+    g_macedit  = mk("EDIT", "", ES_AUTOHSCROLL | WS_BORDER, IDC_MAC_EDIT, w);
+    SendMessageA(g_macedit, EM_SETCUEBANNER, TRUE, (LPARAM)L"AA:BB:CC:DD:EE:FF");
+    g_vlanedit = mk("EDIT", "", ES_AUTOHSCROLL | ES_NUMBER | WS_BORDER, IDC_VLAN_EDIT, w);
+    SendMessageA(g_vlanedit, EM_SETCUEBANNER, TRUE, (LPARAM)L"VLAN");
+    g_addrule  = mk("BUTTON", "Add Rule", BS_PUSHBUTTON, IDC_ADD_RULE_BTN, w);
+    g_remove   = mk("BUTTON", "Remove Rule", BS_PUSHBUTTON, IDC_REMOVE_BTN, w);
+
+    g_rules = mk(WC_LISTVIEWA, "", LVS_REPORT | LVS_SINGLESEL, IDC_RULES_LIST, w);
+    SendMessage(g_rules, LVM_SETEXTENDEDLISTVIEWSTYLE,
+                LVS_EX_FULLROWSELECT, LVS_EX_FULLROWSELECT);
+    lv_add_col(g_rules, 0, "Target MAC", 170);
+    lv_add_col(g_rules, 1, "VLAN", 60);
+    lv_add_col(g_rules, 2, "Out", 90);
+    lv_add_col(g_rules, 3, "In", 90);
+
+    g_start   = mk("BUTTON", "Start", BS_DEFPUSHBUTTON, IDC_START_BTN, w);
+    g_verbose = mk("BUTTON", "Verbose log", BS_AUTOCHECKBOX, IDC_VERBOSE_CHK, w);
+    g_stats   = mk("STATIC", "", SS_LEFT, IDC_STATS_LBL, w);
+    g_log     = mk("EDIT", "",
+                   ES_MULTILINE | ES_READONLY | ES_AUTOVSCROLL | WS_VSCROLL | WS_BORDER,
+                   IDC_LOG_EDIT, w);
+}
+
+static void populate_ifaces(void)
+{
+    g_n_ifaces = engine_enumerate_interfaces(g_ifaces, ENGINE_MAX_IFACES);
+    SendMessage(g_iface, CB_RESETCONTENT, 0, 0);
+    for (int i = 0; i < g_n_ifaces; i++) {
+        char line[400];
+        snprintf(line, sizeof(line), "%s  [%s]",
+                 g_ifaces[i].friendly[0] ? g_ifaces[i].friendly : g_ifaces[i].npf_name,
+                 g_ifaces[i].ip[0] ? g_ifaces[i].ip : "no ip");
+        SendMessageA(g_iface, CB_ADDSTRING, 0, (LPARAM)line);
+    }
+    if (g_n_ifaces > 0) SendMessage(g_iface, CB_SETCURSEL, 0, 0);
+}
+
+static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        g_main = w;
+        create_controls(w);
+        populate_ifaces();
+        ui_set_state(ST_IDLE);
+        SetTimer(w, TIMER_ID, TIMER_MS, NULL);
+        return 0;
+
+    case WM_SIZE:
+        layout(LOWORD(lp), HIWORD(lp));
+        return 0;
+
+    case WM_GETMINMAXINFO: {
+        MINMAXINFO *mmi = (MINMAXINFO *)lp;
+        mmi->ptMinTrackSize.x = 620;
+        mmi->ptMinTrackSize.y = 560;
+        return 0;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case IDC_SCAN_BTN:     on_scan();        return 0;
+        case IDC_ADD_SEL_BTN:  on_add_selected();return 0;
+        case IDC_ADD_RULE_BTN: on_add_rule();    return 0;
+        case IDC_REMOVE_BTN:   on_remove_rule(); return 0;
+        case IDC_START_BTN:    on_start();       return 0;
+        }
+        return 0;
+
+    case WM_NOTIFY: {
+        LPNMHDR nh = (LPNMHDR)lp;
+        if (nh->idFrom == IDC_DISC_LIST && nh->code == NM_DBLCLK) {
+            on_add_selected();
+            return 0;
+        }
+        break;
+    }
+
+    case WM_TIMER:
+        pump_log();
+        if (g_state == ST_SCANNING) disc_refresh();
+        else if (g_state == ST_BRIDGING) { rules_update_counts(); stats_refresh(); }
+        return 0;
+
+    case WM_APP_BRIDGE_DONE:
+    case WM_APP_SCAN_DONE:
+        worker_done();
+        return 0;
+
+    case WM_CLOSE:
+        if (g_state != ST_IDLE) {           /* stop capture before exiting */
+            engine_stop();
+            if (g_worker) {
+                WaitForSingleObject(g_worker, 3000);
+                CloseHandle(g_worker);
+                g_worker = NULL;
+            }
+        }
+        KillTimer(w, TIMER_ID);
+        DestroyWindow(w);
+        return 0;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProc(w, msg, wp, lp);
+}
+
+int WINAPI WinMain(HINSTANCE hInst, HINSTANCE hPrev, LPSTR cmd, int show)
+{
+    (void)hPrev; (void)cmd;
+
+    /* logging into the in-RAM ring, drained by the UI timer */
+    log_init(NULL, LOG_INFO);
+    log_set_memory_sink(1);
+    engine_init();
+
+    INITCOMMONCONTROLSEX icc = { sizeof(icc), ICC_LISTVIEW_CLASSES | ICC_STANDARD_CLASSES };
+    InitCommonControlsEx(&icc);
+    g_font = (HFONT)GetStockObject(DEFAULT_GUI_FONT);
+
+    WNDCLASSA wc; memset(&wc, 0, sizeof(wc));
+    wc.lpfnWndProc   = WndProc;
+    wc.hInstance     = hInst;
+    wc.hCursor       = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)(COLOR_BTNFACE + 1);
+    wc.lpszClassName = "VlanBridgeGui";
+    wc.hIcon         = LoadIcon(NULL, IDI_APPLICATION);
+    if (!RegisterClassA(&wc)) return 1;
+
+    HWND w = CreateWindowExA(0, wc.lpszClassName,
+        "VLAN Bridge — multi-target",
+        WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+        CW_USEDEFAULT, CW_USEDEFAULT, 760, 620,
+        NULL, NULL, hInst, NULL);
+    if (!w) return 1;
+
+    ShowWindow(w, show);
+    UpdateWindow(w);
+
+    MSG m;
+    while (GetMessage(&m, NULL, 0, 0) > 0) {
+        if (IsDialogMessage(w, &m)) continue;   /* Tab navigation between controls */
+        TranslateMessage(&m);
+        DispatchMessage(&m);
+    }
+
+    log_close();
+    return 0;
+}
