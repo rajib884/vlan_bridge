@@ -79,6 +79,7 @@ static HANDLE g_worker = NULL;
 static int    g_state  = ST_IDLE;
 
 static void layout(int cw, int ch);      /* defined in the layout section below */
+static void config_save(void);           /* defined in the config section below */
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
 static void set_font(HWND h) { if (g_font) SendMessage(h, WM_SETFONT, (WPARAM)g_font, TRUE); }
@@ -275,6 +276,7 @@ static void rule_add(const uint8_t *mac, uint16_t vlan)
     memcpy(r->mac, mac, ETH_ALEN);
     r->vlan_id = vlan;
     rules_refresh();
+    config_save();
 }
 
 /* ── discovery view ─────────────────────────────────────────────────────── */
@@ -363,6 +365,88 @@ static void stats_refresh(void)
         (unsigned long long)s.in_stripped, (unsigned long long)s.in_bcast,
         (unsigned long long)s.ignored);
     SetWindowTextA(g_stats, buf);
+}
+
+/* ── config persistence ─────────────────────────────────────────────────── */
+/* Rules, the chosen interface, verbose, and the collapse state are saved to
+ * %APPDATA%\vlan_bridge\config.ini so they survive a restart. APPDATA is used
+ * (not the exe dir) because it is always writable without elevation. */
+static int config_path(char *out, size_t n)
+{
+    const char *appdata = getenv("APPDATA");
+    if (!appdata || !appdata[0]) return 0;
+    char dir[MAX_PATH];
+    snprintf(dir, sizeof(dir), "%s\\vlan_bridge", appdata);
+    CreateDirectoryA(dir, NULL);                 /* harmless if it exists */
+    snprintf(out, n, "%s\\config.ini", dir);
+    return 1;
+}
+
+static void config_save(void)
+{
+    char path[MAX_PATH];
+    if (!config_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "w");
+    if (!f) return;
+
+    int sel = (int)SendMessage(g_iface, CB_GETCURSEL, 0, 0);
+    if (sel >= 0 && sel < g_n_ifaces)
+        fprintf(f, "iface=%s\n", g_ifaces[sel].npf_name);
+    fprintf(f, "verbose=%d\n",
+            SendMessage(g_verbose, BM_GETCHECK, 0, 0) == BST_CHECKED ? 1 : 0);
+    fprintf(f, "collapsed=%d\n", g_disc_collapsed);
+    for (int i = 0; i < g_cfg.n_rules; i++) {
+        char mac[18];
+        engine_format_mac(g_cfg.rules[i].mac, mac, sizeof(mac));
+        fprintf(f, "rule=%s %u\n", mac, g_cfg.rules[i].vlan_id);
+    }
+    fclose(f);
+}
+
+/* Load saved config into the UI. Called once at startup after the interface
+ * list is populated. Silently ignores a missing or partly malformed file. */
+static void config_load(void)
+{
+    char path[MAX_PATH];
+    if (!config_path(path, sizeof(path))) return;
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+
+    char line[512], saved_iface[300] = "";
+    while (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        if (strncmp(line, "iface=", 6) == 0) {
+            snprintf(saved_iface, sizeof(saved_iface), "%s", line + 6);
+        } else if (strncmp(line, "verbose=", 8) == 0) {
+            SendMessage(g_verbose, BM_SETCHECK,
+                        atoi(line + 8) ? BST_CHECKED : BST_UNCHECKED, 0);
+        } else if (strncmp(line, "collapsed=", 10) == 0) {
+            g_disc_collapsed = atoi(line + 10) ? 1 : 0;
+            SetWindowTextA(g_disc_toggle, g_disc_collapsed ? "Show" : "Hide");
+        } else if (strncmp(line, "rule=", 5) == 0) {
+            char macbuf[64]; int vid = 0;
+            if (sscanf(line + 5, "%63s %d", macbuf, &vid) == 2) {
+                uint8_t mac[ETH_ALEN];
+                if (engine_parse_mac(macbuf, mac) == 0 && vid >= 1 && vid <= 4094 &&
+                    g_cfg.n_rules < ENGINE_MAX_RULES && !rule_exists(mac)) {
+                    engine_rule_t *r = &g_cfg.rules[g_cfg.n_rules++];
+                    memset(r, 0, sizeof(*r));
+                    memcpy(r->mac, mac, ETH_ALEN);
+                    r->vlan_id = (uint16_t)vid;
+                }
+            }
+        }
+    }
+    fclose(f);
+
+    rules_refresh();
+    if (saved_iface[0]) {                         /* re-select the saved NIC */
+        for (int i = 0; i < g_n_ifaces; i++)
+            if (strcmp(g_ifaces[i].npf_name, saved_iface) == 0) {
+                SendMessage(g_iface, CB_SETCURSEL, i, 0);
+                break;
+            }
+    }
 }
 
 /* ── worker threads ─────────────────────────────────────────────────────── */
@@ -469,6 +553,7 @@ static void on_remove_rule(void)
         g_cfg.rules[i] = g_cfg.rules[i + 1];
     g_cfg.n_rules--;
     rules_refresh();
+    config_save();
 }
 
 static void on_toggle_disc(void)
@@ -479,6 +564,7 @@ static void on_toggle_disc(void)
     SetWindowTextA(g_disc_toggle, g_disc_collapsed ? "Show" : "Hide");
     RECT rc; GetClientRect(g_main, &rc);
     layout(rc.right, rc.bottom);
+    config_save();
 }
 
 static void on_disc_colclick(int col)
@@ -521,6 +607,7 @@ static void on_start(void)
         return;
     }
     g_cfg.verbose = (SendMessage(g_verbose, BM_GETCHECK, 0, 0) == BST_CHECKED);
+    config_save();                       /* persist iface + verbose choice */
 
     /* reset per-rule counters for a fresh run */
     for (int i = 0; i < g_cfg.n_rules; i++)
@@ -738,6 +825,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         g_main = w;
         create_controls(w);
         populate_ifaces();
+        config_load();        /* restore rules / iface / verbose from last run */
         ui_set_state(ST_IDLE);
         stats_refresh();      /* show zeroed counters rather than a blank line */
         SetTimer(w, TIMER_ID, TIMER_MS, NULL);
@@ -777,6 +865,12 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         case IDC_REMOVE_BTN:   on_remove_rule(); return 0;
         case IDC_START_BTN:    on_start();       return 0;
         case IDC_DISC_TOGGLE:  on_toggle_disc(); return 0;
+        case IDC_IFACE_COMBO:
+            if (HIWORD(wp) == CBN_SELCHANGE) config_save();
+            return 0;
+        case IDC_VERBOSE_CHK:
+            if (HIWORD(wp) == BN_CLICKED) config_save();
+            return 0;
         }
         return 0;
 
@@ -807,6 +901,7 @@ static LRESULT CALLBACK WndProc(HWND w, UINT msg, WPARAM wp, LPARAM lp)
         return 0;
 
     case WM_CLOSE:
+        config_save();                      /* persist final UI state */
         if (g_state != ST_IDLE) {           /* stop capture before exiting */
             engine_stop();
             if (g_worker) {

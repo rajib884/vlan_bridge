@@ -113,6 +113,11 @@ Or just `make` / `make gui` under MSYS2 with `SDK=/c/npcap-sdk CC=gcc`.
     (Rules only sort while stopped.)
 12. **Hide/Show** toggle on the "Discovered devices" header collapses the scan
     section; the log pane grows to fill the freed space.
+13. **Config persists across restarts:** add rules / pick an interface / set
+    verbose / collapse, close the app, reopen — the same state is restored.
+    Config is `%APPDATA%\vlan_bridge\config.ini` (plain text: `iface=`,
+    `verbose=`, `collapsed=`, one `rule=MAC VID` per rule). Deleting the file
+    resets to empty; a malformed line is skipped, not fatal.
 
 ### CLI (`vlan_bridge.exe`) — regression
 - `vlan_bridge -l` lists interfaces (name/IP/MAC).
