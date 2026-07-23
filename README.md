@@ -18,7 +18,9 @@ The core lives in `engine.c` (shared by both front-ends); `vlan_bridge.c` is the
 
 - Windows (Vista or later, x64)
 - [Npcap](https://npcap.com/) installed in WinPcap API-compatible mode
-- Administrator privileges (required for raw packet access)
+- Raw packet access via Npcap. This works for non-admin users unless Npcap was
+  installed with "Restrict Npcap driver's access to Administrators only" — in
+  that case run elevated.
 
 ## Build
 
@@ -42,7 +44,9 @@ make gui      # builds the GUI  -> vlan_bridge_gui.exe
 
 ## GUI
 
-Run `vlan_bridge_gui.exe` (it requests Administrator via its manifest). One
+Run `vlan_bridge_gui.exe` (no elevation needed — it runs as the current user;
+Npcap grants access to non-admin users unless installed with "Restrict to
+Administrators"). One
 window covers the whole workflow:
 
 1. Pick the trunk **interface** from the dropdown.

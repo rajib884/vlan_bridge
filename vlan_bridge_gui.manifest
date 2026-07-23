@@ -5,8 +5,11 @@
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <!-- Npcap raw capture/injection requires Administrator. -->
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <!-- Run at the caller's level (no UAC elevation). Npcap grants raw
+             capture/injection to non-admin users unless it was installed with
+             "Restrict to Administrators"; the GUI reports an access error at
+             Start rather than forcing elevation up front. -->
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>

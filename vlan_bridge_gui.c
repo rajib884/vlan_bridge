@@ -3,8 +3,9 @@
  *
  * Single window, single process. Capture runs on a worker thread against the
  * shared engine_config_t; the UI thread refreshes stats/discovery/log on a
- * timer and never touches pcap directly. Requires Administrator (Npcap) — the
- * embedded manifest requests elevation.
+ * timer and never touches pcap directly. Runs at the caller's privilege level
+ * (manifest requests asInvoker, no UAC); Npcap serves non-admin users unless
+ * installed with "Restrict to Administrators".
  *
  * Build: see the `gui` target in the Makefile.
  */

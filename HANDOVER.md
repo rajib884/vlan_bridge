@@ -29,7 +29,7 @@ GUI**. Design decisions locked with the user:
 | `engine.c` / `engine.h` | **New.** The whole core, extracted from the old `vlan_bridge.c` and generalized to multiple rules. Tag/strip + checksum helpers are byte-for-byte the same as before. |
 | `vlan_bridge.c` | **Rewritten.** Now just the CLI `main()` over the engine. |
 | `vlan_bridge_gui.c` | **New.** Win32 GUI (`WinMain`). |
-| `vlan_bridge_gui.rc` / `.manifest` | **New.** Embeds a `requireAdministrator` + comctl6 manifest. |
+| `vlan_bridge_gui.rc` / `.manifest` | **New.** Embeds an `asInvoker` (no UAC) + comctl6 manifest. |
 | `fast_log.c` / `fast_log.h` | Added a thread-safe memory sink: `log_set_memory_sink()` + `log_drain()`, plus a `CRITICAL_SECTION` guarding all ring ops. File/stdout behavior for the CLI is unchanged. |
 | `Makefile` | Added `make gui`. `make` still builds the CLI. |
 
@@ -85,11 +85,13 @@ Or just `make` / `make gui` under MSYS2 with `SDK=/c/npcap-sdk CC=gcc`.
 
 ---
 
-## Validation checklist (please run on Windows + Npcap, elevated)
+## Validation checklist (please run on Windows + Npcap)
 
 ### GUI (`vlan_bridge_gui.exe`)
-1. Launches and triggers a **UAC elevation** prompt. Window opens ~760×620,
-   **resizes** cleanly (log/lists stretch; min size enforced).
+1. Launches with **no UAC prompt** (manifest is `asInvoker`). Window opens
+   ~760×620, **resizes** cleanly (log/lists stretch; min size enforced). If Npcap
+   was installed "admin-only", capture fails at Start with an access error — that
+   is expected; run elevated in that case.
 2. **Interface** dropdown lists up Ethernet adapters with name + IP.
 3. **Scan** → discovery list fills with `(VLAN, MAC, IP, pkts)` as tagged ARP/ICMP
    arrives; button toggles to **Stop Scan** and back.
