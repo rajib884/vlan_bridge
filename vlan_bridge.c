@@ -519,7 +519,12 @@ static void fix_transport_checksum(uint8_t *ip,
     *csum = 0;
     uint32_t sum = cksum_add(0, pseudo, 12);
     sum = cksum_add(sum, transport, tlen);
-    *csum = cksum_fold(sum);
+    uint16_t folded = cksum_fold(sum);
+    /* RFC 768: a computed UDP checksum of 0x0000 must be sent as 0xFFFF, since
+     * zero is reserved to mean "no checksum". TCP has no such rule. */
+    if (folded == 0 && proto == IP_PROTO_UDP)
+        folded = 0xFFFF;
+    *csum = folded;
 }
 
 #if 0
@@ -997,6 +1002,26 @@ done:
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
+/* Handle set in main so the console-control handler can break the capture loop
+ * on Ctrl+C, Ctrl+Break, or console close. */
+static pcap_t *g_pcap_handle = NULL;
+
+static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type)
+{
+    switch (ctrl_type) {
+        case CTRL_C_EVENT:
+        case CTRL_BREAK_EVENT:
+        case CTRL_CLOSE_EVENT:
+        case CTRL_LOGOFF_EVENT:
+        case CTRL_SHUTDOWN_EVENT:
+            if (g_pcap_handle)
+                pcap_breakloop(g_pcap_handle);  /* makes pcap_loop return */
+            return TRUE;
+        default:
+            return FALSE;
+    }
+}
+
 static void usage(const char *prog)
 {
     log_printf(LOG_ERROR,
@@ -1113,6 +1138,11 @@ int main(int argc, char *argv[])
     }
     pcap_freecode(&fp);
 
+    /* Install a console-control handler so Ctrl+C breaks the capture loop
+     * cleanly (lets us print stats and flush the log instead of dying). */
+    g_pcap_handle = ctx.handle;
+    SetConsoleCtrlHandler(console_ctrl_handler, TRUE);
+
     log_printf(LOG_INFO, "Listening... (Ctrl+C to stop)\n\n");
     log_set_level(LOG_ERROR);
     log_flush();
@@ -1121,6 +1151,7 @@ int main(int argc, char *argv[])
     pcap_loop(ctx.handle, 0, packet_handler, (u_char *)&ctx);
 
     /* ── cleanup / stats ─────────────────────────────────────────────── */
+    log_set_level(LOG_INFO);   /* restore so the stats below actually print */
     log_printf(LOG_INFO, "\n--- Stats ---\n");
     log_printf(LOG_INFO, "Unicast   tagged   (OUT): %llu\n", ctx.tagged_sent);
     log_printf(LOG_INFO, "Broadcast tagged   (OUT): %llu\n", ctx.bcast_tagged_sent);
@@ -1132,6 +1163,6 @@ int main(int argc, char *argv[])
     log_printf(LOG_INFO, "Ignored                 : %llu\n", ctx.ignored);
 
     pcap_close(ctx.handle);
-    log_flush();
+    log_close();   /* flush remaining log data and close the handle */
     return 0;
 }

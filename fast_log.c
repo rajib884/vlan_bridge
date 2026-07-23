@@ -99,6 +99,10 @@ void log_printf(log_level_t log_level, const char *fmt, ...)
     va_start(ap, fmt);
     int len = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
+    /* vsnprintf returns the length it WOULD have written; clamp so a truncated
+     * message never makes log_write read past tmp. */
+    if (len >= (int)sizeof(tmp))
+        len = (int)sizeof(tmp) - 1;
     if (len > 0)
         log_write(tmp, len);
     return;
