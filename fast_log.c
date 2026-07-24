@@ -13,15 +13,27 @@ typedef struct
     int read_pos;  // next byte to flush
     HANDLE file;
     log_level_t min_level;
+    int memory_mode;        // 1 = log_flush() is a no-op; drain via log_drain()
+    CRITICAL_SECTION cs;
+    int cs_init;
 } Logger;
 
 static Logger g_log;
+
+static inline void log_lock(void)   { if (g_log.cs_init) EnterCriticalSection(&g_log.cs); }
+static inline void log_unlock(void) { if (g_log.cs_init) LeaveCriticalSection(&g_log.cs); }
 
 void log_init(const char *filename, log_level_t log_level)
 {
     g_log.write_pos = 0;
     g_log.read_pos = 0;
     g_log.min_level = log_level;
+    g_log.memory_mode = 0;
+    if (!g_log.cs_init)
+    {
+        InitializeCriticalSection(&g_log.cs);
+        g_log.cs_init = 1;
+    }
     if (filename != NULL)
     {
         g_log.file = CreateFileA( filename, GENERIC_WRITE,
@@ -46,7 +58,8 @@ void log_init(const char *filename, log_level_t log_level)
 void log_close(void)
 {
     log_flush();
-    CloseHandle(g_log.file);
+    if (!g_log.memory_mode)
+        CloseHandle(g_log.file);
 }
 
 void log_set_level(log_level_t level)
@@ -54,24 +67,49 @@ void log_set_level(log_level_t level)
     g_log.min_level = level;
 }
 
-// How many bytes are pending (not yet flushed)
+void log_set_memory_sink(int enabled)
+{
+    g_log.memory_mode = enabled ? 1 : 0;
+}
+
+// How many bytes are pending (not yet flushed/drained)
 static inline int log_pending(void)
 {
     return (g_log.write_pos - g_log.read_pos) & LOG_RING_MASK;
 }
 
-// Write to ring buffer. If there's no room, flush first.
+// Write to ring buffer. If there's no room, flush (file mode) or drop the
+// oldest pending bytes (memory mode) to make room.
 void log_write(const char *data, int len)
 {
-    // If message won't fit, flush to make room
-    if (len > LOG_RING_SIZE - log_pending() - 1)
-        log_flush();
+    log_lock();
 
-    // If message is larger than the entire ring, write directly
+    // If message won't fit, make room.
+    if (len > LOG_RING_SIZE - log_pending() - 1)
+    {
+        if (g_log.memory_mode)
+        {
+            // Drop oldest: advance read_pos so the new data fits.
+            int need = len - (LOG_RING_SIZE - log_pending() - 1);
+            g_log.read_pos = (g_log.read_pos + need) & LOG_RING_MASK;
+        }
+        else
+        {
+            log_unlock();
+            log_flush();
+            log_lock();
+        }
+    }
+
+    // If message is larger than the entire ring, write directly (file mode only).
     if (len >= LOG_RING_SIZE)
     {
-        DWORD written;
-        WriteFile(g_log.file, data, len, &written, NULL);
+        if (!g_log.memory_mode)
+        {
+            DWORD written;
+            WriteFile(g_log.file, data, len, &written, NULL);
+        }
+        log_unlock();
         return;
     }
 
@@ -87,6 +125,8 @@ void log_write(const char *data, int len)
         memcpy(g_log.buf, data + space_to_end, len - space_to_end);
     }
     g_log.write_pos = (g_log.write_pos + len) & LOG_RING_MASK;
+
+    log_unlock();
 }
 
 // printf-style logging: formats into a stack buffer, then into ring
@@ -108,114 +148,51 @@ void log_printf(log_level_t log_level, const char *fmt, ...)
     return;
 }
 
-// Drain pending bytes from ring buffer to disk in one or two WriteFile calls
+// Drain pending bytes from ring buffer to disk in one or two WriteFile calls.
+// In memory mode this is a no-op (the GUI pulls bytes with log_drain instead).
 void log_flush(void)
 {
+    if (g_log.memory_mode)
+        return;
+
+    log_lock();
     int pending = log_pending();
-    if (pending == 0) return;
+    if (pending == 0) { log_unlock(); return; }
 
     DWORD written;
     int to_end = LOG_RING_SIZE - g_log.read_pos;
 
     if (pending <= to_end) {
-        // Contiguous chunk
         WriteFile(g_log.file, g_log.buf + g_log.read_pos, pending, &written, NULL);
     } else {
-        // Two chunks: tail of buffer, then wrap-around head
         WriteFile(g_log.file, g_log.buf + g_log.read_pos, to_end,          &written, NULL);
         WriteFile(g_log.file, g_log.buf,                  pending - to_end, &written, NULL);
     }
 
     g_log.read_pos = (g_log.read_pos + pending) & LOG_RING_MASK;
+    log_unlock();
 }
 
-#if 0
-// ---------------------------------------------------------------
-// Usage example — drop-in for your TFTP session logging
-// ---------------------------------------------------------------
-
-// Call this AFTER sending the reply, not before.
-// The log is batched in RAM and flushed in big chunks.
-void log_session(int i)
+// Copy up to max_len pending bytes into dst (no NUL added), advancing read_pos.
+// Returns the number of bytes copied. Safe to call from a different thread than
+// the one calling log_printf.
+int log_drain(char *dst, int max_len)
 {
-    // Replace with your actual session fields
-    unsigned session_id  = 42;
-    int      in_use      = 1;   // TFTP_RECEIVING
-    int      ftp         = 0;
-    unsigned client_ip   = 0x0100007f; // 127.0.0.1
-    unsigned client_port = 1234;
-    short    vlan_id     = 10;
-    unsigned server_port = 69;
+    if (max_len <= 0) return 0;
 
-    char ip_str[16];
-    // inet_ntoa equivalent, avoiding the static buffer issue
-    unsigned char *b = (unsigned char *)&client_ip;
-    snprintf(ip_str, sizeof(ip_str), "%u.%u.%u.%u", b[0], b[1], b[2], b[3]);
+    log_lock();
+    int pending = log_pending();
+    int n = pending < max_len ? pending : max_len;
+    if (n <= 0) { log_unlock(); return 0; }
 
-    log_printf("\nSession ID: %3u [%s]%s\n  %s:%u [VLAN:%d]\n  Session Server Port: %u\n",
-        i,
-        (in_use == 1) ? "WRQ" : "RRQ",
-        ftp ? "[FTP]" : "",
-        ip_str,
-        client_port,
-        vlan_id,
-        server_port
-    );
-
-    // Flush strategy options (pick one):
-    //   A) Flush here every call      — lowest latency, more WriteFile calls
-    //   B) Flush every N sessions     — good balance
-    //   C) Flush in your select/recv  — flush while waiting for next packet (best)
-    //   D) Flush only on ring-full    — maximum batching, highest throughput
-
-    // Option C is recommended: call log_flush() right before your blocking recv,
-    // so the disk write happens while you're waiting for network anyway.
-}
-
-#include <stdio.h>
-#include <sys/time.h>
-#include <time.h>
-
-#include <windows.h>
-#include <stdio.h>
-
-int main(void)
-{
-    log_init("log.log");
-
-    SYSTEMTIME st_start, st_end;
-    FILETIME ft_start, ft_end;
-
-    GetLocalTime(&st_start);
-
-    for (int i = 0; i < 10000; i++) {
-        log_session(i);
+    int to_end = LOG_RING_SIZE - g_log.read_pos;
+    if (n <= to_end) {
+        memcpy(dst, g_log.buf + g_log.read_pos, n);
+    } else {
+        memcpy(dst, g_log.buf + g_log.read_pos, to_end);
+        memcpy(dst + to_end, g_log.buf, n - to_end);
     }
-        log_flush();
-
-    GetLocalTime(&st_end);
-
-    // Convert SYSTEMTIME to FILETIME
-    SystemTimeToFileTime(&st_start, &ft_start);
-    SystemTimeToFileTime(&st_end, &ft_end);
-
-    // Convert FILETIME to 64-bit integers
-    ULARGE_INTEGER t1, t2;
-    t1.LowPart  = ft_start.dwLowDateTime;
-    t1.HighPart = ft_start.dwHighDateTime;
-
-    t2.LowPart  = ft_end.dwLowDateTime;
-    t2.HighPart = ft_end.dwHighDateTime;
-
-    // Difference in 100-nanosecond intervals
-    ULONGLONG diff = t2.QuadPart - t1.QuadPart;
-
-    // Convert to milliseconds
-    double diff_ms = diff / 10000.0;
-
-    printf("Elapsed time: %.3f ms\n", diff_ms);
-
-    log_close();
-    return 0;
+    g_log.read_pos = (g_log.read_pos + n) & LOG_RING_MASK;
+    log_unlock();
+    return n;
 }
-#endif

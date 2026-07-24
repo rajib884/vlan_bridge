@@ -2,6 +2,9 @@
 *.exe
 *.o
 
+# Delay-import library generated from wpcap_delay.def by `make`
+libwpcap_delay.a
+
 # Auto-downloaded Npcap SDK (fetched by `make`)
 npcap-sdk/
 npcap-sdk.zip
